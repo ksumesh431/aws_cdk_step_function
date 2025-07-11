@@ -1,19 +1,283 @@
 from aws_cdk import (
-    # Duration,
+    Duration,
     Stack,
-    # aws_sqs as sqs,
+    RemovalPolicy,
+    aws_iam as iam,
+    aws_rds as rds,
+    aws_ec2 as ec2,
+    aws_apigateway as apigateway,
+    aws_lambda as lambda_,
+    aws_stepfunctions as sfn,
+    aws_stepfunctions_tasks as tasks,
 )
 from constructs import Construct
+
 
 class StepFuncProjectStack(Stack):
 
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # The code that defines your stack goes here
+        # Create a VPC for the RDS instance
+        vpc = ec2.Vpc(self, "StepFuncProjectVpc", max_azs=2)
 
-        # example resource
-        # queue = sqs.Queue(
-        #     self, "StepFuncProjectQueue",
-        #     visibility_timeout=Duration.seconds(300),
-        # )
+        # Create a security group for the RDS instance
+        rds_sg = ec2.SecurityGroup(
+            self,
+            "StepFuncProjectRdsSG",
+            vpc=vpc,
+            description="Allow PostgreSQL access",
+            allow_all_outbound=True,
+        )
+        rds_sg.add_ingress_rule(
+            peer=ec2.Peer.any_ipv4(),
+            connection=ec2.Port.tcp(5432),
+            description="Allow PostgreSQL access from anywhere",
+        )
+
+        # Create the RDS PostgreSQL instance
+        db_instance = rds.DatabaseInstance(
+            self,
+            "StepFuncProjectPostgres",
+            engine=rds.DatabaseInstanceEngine.postgres(
+                version=rds.PostgresEngineVersion.VER_17_4
+            ),
+            vpc=vpc,
+            vpc_subnets=ec2.SubnetSelection(
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
+            security_groups=[rds_sg],
+            instance_type=ec2.InstanceType.of(
+                ec2.InstanceClass.BURSTABLE4_GRAVITON, ec2.InstanceSize.MICRO
+            ),
+            allocated_storage=20,
+            max_allocated_storage=30,
+            multi_az=False,
+            publicly_accessible=False,
+            credentials=rds.Credentials.from_generated_secret("postgres"),
+            removal_policy=RemovalPolicy.DESTROY,
+            deletion_protection=False,
+            iam_authentication=True,
+        )
+
+        # IAM role with permissions to access rds
+        role = iam.Role(
+            self,
+            "LambdaExecutionRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "CloudWatchFullAccessV2"
+                ),
+                iam.ManagedPolicy.from_aws_managed_policy_name("AmazonRDSFullAccess"),
+            ],
+        )
+
+        # create layer
+        layer = lambda_.LayerVersion(
+            self,
+            "helper_layer",
+            code=lambda_.Code.from_asset("layer"),
+            description="Common helper utility",
+            compatible_runtimes=[
+                lambda_.Runtime.PYTHON_3_13,
+            ],
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # Lambda function (code in lambda directory)
+        lambda_function_1 = lambda_.Function(
+            self,
+            "StepFuncProject_LambdaFunction_1",
+            description="1st Lambda in the step functions to interact with RDS",
+            function_name="StepFuncProject_LambdaFunction_1",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            code=lambda_.Code.from_asset("lambdas/lambda_1"),
+            handler="index.lambda_handler",
+            role=role,
+            layers=[layer],
+        )
+        # Lambda function (code in lambda directory)
+        lambda_function_2 = lambda_.Function(
+            self,
+            "StepFuncProject_LambdaFunction_2",
+            # description="1st Lambda in the step functions to interact with RDS",
+            function_name="StepFuncProject_LambdaFunction_2",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            code=lambda_.Code.from_asset("lambdas/lambda_2"),
+            handler="index.lambda_handler",
+            role=role,
+            layers=[layer],
+        )
+        # Lambda function (code in lambda directory)
+        lambda_function_3 = lambda_.Function(
+            self,
+            "StepFuncProject_LambdaFunction_3",
+            # description="1st Lambda in the step functions to interact with RDS",
+            function_name="StepFuncProject_LambdaFunction_3",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            code=lambda_.Code.from_asset("lambdas/lambda_3"),
+            handler="index.lambda_handler",
+            role=role,
+            layers=[layer],
+        )
+        # Lambda function (code in lambda directory)
+        lambda_error_handler = lambda_.Function(
+            self,
+            "StepFuncProject_LambdaErrorHandler",
+            description="Lambda function to handle errors in the step functions",
+            function_name="StepFuncProject_LambdaErrorHandler",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            code=lambda_.Code.from_asset("lambdas/lambda_error_handler"),
+            handler="index.lambda_handler",
+            role=role,
+            layers=[layer],
+        )
+
+        # Grant full access to the RDS instance
+        db_instance.grant_connect(lambda_function_1)
+        db_instance.grant_connect(lambda_function_2)
+        db_instance.grant_connect(lambda_function_3)
+
+        # API Gateway REST API
+        api = apigateway.RestApi(self, "StepFuncProjectApi")
+        # Define API Gateway resources and methods
+        invoke_resource = api.root.add_resource("invoke")
+
+        invoke_resource.add_method(
+            "POST",
+            apigateway.LambdaIntegration(lambda_function_1),
+        )
+
+        #################################################
+        # Step Functions State Machine
+        #################################################
+        # 1️⃣  Lambda-invoke tasks -------------------------------------------------------
+        invoke_1 = tasks.LambdaInvoke(
+            self,
+            "Lambda Invoke 1",
+            lambda_function=lambda_function_1,
+            payload=sfn.TaskInput.from_json_path_at(
+                "$"
+            ),  # pass caller input straight through
+            output_path="$.Payload",  # keep Lambda’s response only
+        ).add_retry(
+            interval=Duration.seconds(1),
+            max_attempts=3,
+            backoff_rate=2.0,
+            errors=[
+                "Lambda.ServiceException",
+                "Lambda.AWSLambdaException",
+                "Lambda.SdkClientException",
+                "Lambda.TooManyRequestsException",
+            ],
+            jitter_strategy=sfn.JitterType.FULL,
+        )
+
+        invoke_2 = tasks.LambdaInvoke(
+            self,
+            "Lambda Invoke 2",
+            lambda_function=lambda_function_2,
+            payload=sfn.TaskInput.from_json_path_at("$"),
+            output_path="$.Payload",
+        ).add_retry(
+            interval=Duration.seconds(1),
+            max_attempts=3,
+            backoff_rate=2.0,
+            errors=[
+                "Lambda.ServiceException",
+                "Lambda.AWSLambdaException",
+                "Lambda.SdkClientException",
+                "Lambda.TooManyRequestsException",
+            ],
+            jitter_strategy=sfn.JitterType.FULL,
+        )
+
+        invoke_3 = tasks.LambdaInvoke(
+            self,
+            "Lambda Invoke 3",
+            lambda_function=lambda_function_3,
+            payload=sfn.TaskInput.from_json_path_at("$"),
+            output_path="$.Payload",
+        ).add_retry(
+            interval=Duration.seconds(1),
+            max_attempts=3,
+            backoff_rate=2.0,
+            errors=[
+                "Lambda.ServiceException",
+                "Lambda.AWSLambdaException",
+                "Lambda.SdkClientException",
+                "Lambda.TooManyRequestsException",
+            ],
+            jitter_strategy=sfn.JitterType.FULL,
+        )
+
+        # A reusable helper that wraps the error-handler Lambda and immediately fails
+        def make_error_branch(scope: Construct, idx: int) -> sfn.Chain:
+            err_invoke = tasks.LambdaInvoke(
+                scope,
+                f"Lambda error handler ({idx})",
+                lambda_function=lambda_error_handler,
+                payload=sfn.TaskInput.from_json_path_at("$"),
+                output_path="$.Payload",
+            ).add_retry(
+                interval=Duration.seconds(1),
+                max_attempts=3,
+                backoff_rate=2.0,
+                errors=[
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException",
+                ],
+                jitter_strategy=sfn.JitterType.FULL,
+            )
+
+            return err_invoke.next(sfn.Fail(scope, f"Fail {idx}"))
+
+        # 2️⃣  Choice states ------------------------------------------------------------
+        choice_3 = (
+            sfn.Choice(self, "Choice 3")
+            .when(
+                sfn.Condition.boolean_equals("$.success", False),
+                make_error_branch(self, 3),
+            )
+            .otherwise(sfn.Succeed(self, "Success"))
+        )
+
+        choice_2 = (
+            sfn.Choice(self, "Choice 2")
+            .when(
+                sfn.Condition.boolean_equals("$.success", False),
+                make_error_branch(self, 2),
+            )
+            .otherwise(invoke_3.next(choice_3))
+        )
+
+        choice_1 = (
+            sfn.Choice(self, "Choice 1")
+            .when(
+                sfn.Condition.boolean_equals("$.success", False),
+                make_error_branch(self, 1),
+            )
+            .otherwise(invoke_2.next(choice_2))
+        )
+
+        # 3️⃣  Glue it all together ------------------------------------------------------
+        definition = invoke_1.next(choice_1)
+
+        state_machine = sfn.StateMachine(
+            self,
+            "StepFuncProjectStateMachine",
+            definition_body=sfn.DefinitionBody.from_chainable(definition),
+            timeout=Duration.minutes(5),
+        )
+
+        # grant the state machine permission to call your Lambdas
+        for fn in [
+            lambda_function_1,
+            lambda_function_2,
+            lambda_function_3,
+            lambda_error_handler,
+        ]:
+            fn.grant_invoke(state_machine.role)
