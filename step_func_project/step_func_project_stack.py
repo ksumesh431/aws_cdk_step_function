@@ -94,56 +94,65 @@ class StepFuncProjectStack(Stack):
         #################################################
         # Lambda Functions
         #################################################
-        lambda_function_1 = lambda_.Function(
-            self,
-            "StepFuncProject_LambdaFunction_1",
-            description="1st Lambda in the step functions to interact with RDS",
-            function_name="StepFuncProject_LambdaFunction_1",
-            runtime=lambda_.Runtime.PYTHON_3_13,
-            code=lambda_.Code.from_asset("lambdas/lambda_1"),
-            handler="index.lambda_handler",
-            role=role,
-            layers=[layer],
-        )
+        lambda_configs = [
+            {
+                "id": "StepFuncProject_LambdaFunction_1",
+                "desc": "1st Lambda in the step functions to interact with RDS",
+                "name": "StepFuncProject_LambdaFunction_1",
+                "asset": "lambdas/lambda_1",
+            },
+            {
+                "id": "StepFuncProject_LambdaFunction_2",
+                "desc": None,
+                "name": "StepFuncProject_LambdaFunction_2",
+                "asset": "lambdas/lambda_2",
+            },
+            {
+                "id": "StepFuncProject_LambdaFunction_3",
+                "desc": None,
+                "name": "StepFuncProject_LambdaFunction_3",
+                "asset": "lambdas/lambda_3",
+            },
+            {
+                "id": "StepFuncProject_LambdaErrorHandler",
+                "desc": "Lambda function to handle errors in the step functions",
+                "name": "StepFuncProject_LambdaErrorHandler",
+                "asset": "lambdas/lambda_error_handler",
+            },
+        ]
 
-        lambda_function_2 = lambda_.Function(
-            self,
-            "StepFuncProject_LambdaFunction_2",
-            function_name="StepFuncProject_LambdaFunction_2",
-            runtime=lambda_.Runtime.PYTHON_3_13,
-            code=lambda_.Code.from_asset("lambdas/lambda_2"),
-            handler="index.lambda_handler",
-            role=role,
-            layers=[layer],
-        )
+        lambda_functions = []
+        for cfg in lambda_configs:
+            kwargs = (
+                {
+                    "description": cfg["desc"],
+                }
+                if cfg["desc"]
+                else {}
+            )
+            fn = lambda_.Function(
+                self,
+                cfg["id"],
+                function_name=cfg["name"],
+                runtime=lambda_.Runtime.PYTHON_3_13,
+                code=lambda_.Code.from_asset(cfg["asset"]),
+                handler="index.lambda_handler",
+                role=role,
+                layers=[layer],
+                **kwargs,
+            )
+            lambda_functions.append(fn)
 
-        lambda_function_3 = lambda_.Function(
-            self,
-            "StepFuncProject_LambdaFunction_3",
-            function_name="StepFuncProject_LambdaFunction_3",
-            runtime=lambda_.Runtime.PYTHON_3_13,
-            code=lambda_.Code.from_asset("lambdas/lambda_3"),
-            handler="index.lambda_handler",
-            role=role,
-            layers=[layer],
-        )
-
-        lambda_error_handler = lambda_.Function(
-            self,
-            "StepFuncProject_LambdaErrorHandler",
-            description="Lambda function to handle errors in the step functions",
-            function_name="StepFuncProject_LambdaErrorHandler",
-            runtime=lambda_.Runtime.PYTHON_3_13,
-            code=lambda_.Code.from_asset("lambdas/lambda_error_handler"),
-            handler="index.lambda_handler",
-            role=role,
-            layers=[layer],
-        )
+        (
+            lambda_function_1,
+            lambda_function_2,
+            lambda_function_3,
+            lambda_error_handler,
+        ) = lambda_functions
 
         # Allow Lambdas to connect to the database
-        db_instance.grant_connect(lambda_function_1)
-        db_instance.grant_connect(lambda_function_2)
-        db_instance.grant_connect(lambda_function_3)
+        for fn in [lambda_function_1, lambda_function_2, lambda_function_3]:
+            db_instance.grant_connect(fn)
 
         #################################################
         # API Gateway
