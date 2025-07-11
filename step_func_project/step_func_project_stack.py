@@ -14,10 +14,12 @@ from constructs import Construct
 
 
 class StepFuncProjectStack(Stack):
-
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        #################################################
+        # Networking (VPC & Security Groups)
+        #################################################
         # Create a VPC for the RDS instance
         vpc = ec2.Vpc(self, "StepFuncProjectVpc", max_azs=2)
 
@@ -35,7 +37,9 @@ class StepFuncProjectStack(Stack):
             description="Allow PostgreSQL access from anywhere",
         )
 
-        # Create the RDS PostgreSQL instance
+        #################################################
+        # Database (Amazon RDS for PostgreSQL)
+        #################################################
         db_instance = rds.DatabaseInstance(
             self,
             "StepFuncProjectPostgres",
@@ -60,7 +64,9 @@ class StepFuncProjectStack(Stack):
             iam_authentication=True,
         )
 
-        # IAM role with permissions to access rds
+        #################################################
+        # IAM Roles & Permissions
+        #################################################
         role = iam.Role(
             self,
             "LambdaExecutionRole",
@@ -73,19 +79,21 @@ class StepFuncProjectStack(Stack):
             ],
         )
 
-        # create layer
+        #################################################
+        # Lambda Layer
+        #################################################
         layer = lambda_.LayerVersion(
             self,
             "helper_layer",
             code=lambda_.Code.from_asset("layer"),
             description="Common helper utility",
-            compatible_runtimes=[
-                lambda_.Runtime.PYTHON_3_13,
-            ],
+            compatible_runtimes=[lambda_.Runtime.PYTHON_3_13],
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # Lambda function (code in lambda directory)
+        #################################################
+        # Lambda Functions
+        #################################################
         lambda_function_1 = lambda_.Function(
             self,
             "StepFuncProject_LambdaFunction_1",
@@ -97,11 +105,10 @@ class StepFuncProjectStack(Stack):
             role=role,
             layers=[layer],
         )
-        # Lambda function (code in lambda directory)
+
         lambda_function_2 = lambda_.Function(
             self,
             "StepFuncProject_LambdaFunction_2",
-            # description="1st Lambda in the step functions to interact with RDS",
             function_name="StepFuncProject_LambdaFunction_2",
             runtime=lambda_.Runtime.PYTHON_3_13,
             code=lambda_.Code.from_asset("lambdas/lambda_2"),
@@ -109,11 +116,10 @@ class StepFuncProjectStack(Stack):
             role=role,
             layers=[layer],
         )
-        # Lambda function (code in lambda directory)
+
         lambda_function_3 = lambda_.Function(
             self,
             "StepFuncProject_LambdaFunction_3",
-            # description="1st Lambda in the step functions to interact with RDS",
             function_name="StepFuncProject_LambdaFunction_3",
             runtime=lambda_.Runtime.PYTHON_3_13,
             code=lambda_.Code.from_asset("lambdas/lambda_3"),
@@ -121,7 +127,7 @@ class StepFuncProjectStack(Stack):
             role=role,
             layers=[layer],
         )
-        # Lambda function (code in lambda directory)
+
         lambda_error_handler = lambda_.Function(
             self,
             "StepFuncProject_LambdaErrorHandler",
@@ -134,33 +140,30 @@ class StepFuncProjectStack(Stack):
             layers=[layer],
         )
 
-        # Grant full access to the RDS instance
+        # Allow Lambdas to connect to the database
         db_instance.grant_connect(lambda_function_1)
         db_instance.grant_connect(lambda_function_2)
         db_instance.grant_connect(lambda_function_3)
 
-        # API Gateway REST API
+        #################################################
+        # API Gateway
+        #################################################
         api = apigateway.RestApi(self, "StepFuncProjectApi")
-        # Define API Gateway resources and methods
         invoke_resource = api.root.add_resource("invoke")
-
         invoke_resource.add_method(
-            "POST",
-            apigateway.LambdaIntegration(lambda_function_1),
+            "POST", apigateway.LambdaIntegration(lambda_function_1)
         )
 
         #################################################
         # Step Functions State Machine
         #################################################
-        # 1️⃣  Lambda-invoke tasks -------------------------------------------------------
+        # 1️⃣ Lambda-invoke tasks ---------------------------------------------------
         invoke_1 = tasks.LambdaInvoke(
             self,
             "Lambda Invoke 1",
             lambda_function=lambda_function_1,
-            payload=sfn.TaskInput.from_json_path_at(
-                "$"
-            ),  # pass caller input straight through
-            output_path="$.Payload",  # keep Lambda’s response only
+            payload=sfn.TaskInput.from_json_path_at("$"),
+            output_path="$.Payload",
         ).add_retry(
             interval=Duration.seconds(1),
             max_attempts=3,
@@ -212,7 +215,7 @@ class StepFuncProjectStack(Stack):
             jitter_strategy=sfn.JitterType.FULL,
         )
 
-        # A reusable helper that wraps the error-handler Lambda and immediately fails
+        # Reusable branch for error handling -------------------------------------
         def make_error_branch(scope: Construct, idx: int) -> sfn.Chain:
             err_invoke = tasks.LambdaInvoke(
                 scope,
@@ -232,10 +235,9 @@ class StepFuncProjectStack(Stack):
                 ],
                 jitter_strategy=sfn.JitterType.FULL,
             )
-
             return err_invoke.next(sfn.Fail(scope, f"Fail {idx}"))
 
-        # 2️⃣  Choice states ------------------------------------------------------------
+        # 2️⃣ Choice states --------------------------------------------------------
         choice_3 = (
             sfn.Choice(self, "Choice 3")
             .when(
@@ -263,7 +265,7 @@ class StepFuncProjectStack(Stack):
             .otherwise(invoke_2.next(choice_2))
         )
 
-        # 3️⃣  Glue it all together ------------------------------------------------------
+        # 3️⃣ Glue everything together --------------------------------------------
         definition = invoke_1.next(choice_1)
 
         state_machine = sfn.StateMachine(
@@ -273,7 +275,7 @@ class StepFuncProjectStack(Stack):
             timeout=Duration.minutes(5),
         )
 
-        # grant the state machine permission to call your Lambdas
+        # Allow Step Functions to call Lambdas
         for fn in [
             lambda_function_1,
             lambda_function_2,
