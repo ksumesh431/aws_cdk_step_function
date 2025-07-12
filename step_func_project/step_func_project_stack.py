@@ -10,6 +10,8 @@ from aws_cdk import (
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
     aws_logs as logs,
+    aws_apigatewayv2 as apigwv2,
+    aws_apigatewayv2_integrations as integ,
 )
 from constructs import Construct
 
@@ -196,12 +198,7 @@ class StepFuncProjectStack(Stack):
                 vpc_subnets=ec2.SubnetSelection(  # optional; keeps them in the NAT gateway subnets
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
                 ),
-                environment={
-                    "DB_SECRET_ARN": db_instance.secret.secret_arn,
-                    "DB_HOST": db_instance.db_instance_endpoint_address,
-                    "DB_PORT": str(db_instance.db_instance_endpoint_port),
-                    "DB_NAME": "postgres",
-                },
+                environment={"DB_SECRET_ARN": db_instance.secret.secret_arn},
                 **kwargs,
             )
             lambda_functions.append(fn)
@@ -220,14 +217,14 @@ class StepFuncProjectStack(Stack):
                 fn
             )  # This allows the Lambda functions to read the database credentials
 
-        #################################################
-        # API Gateway
-        #################################################
-        api = apigateway.RestApi(self, "StepFuncProjectApi")
-        invoke_resource = api.root.add_resource("invoke")
-        invoke_resource.add_method(
-            "POST", apigateway.LambdaIntegration(lambda_function_1)
-        )
+        # #################################################
+        # # API Gateway
+        # #################################################
+        # api = apigateway.RestApi(self, "StepFuncProjectApi")
+        # invoke_resource = api.root.add_resource("invoke")
+        # invoke_resource.add_method(
+        #     "POST", apigateway.LambdaIntegration(lambda_function_1)
+        # )
 
         #################################################
         # Step Functions State Machine
@@ -364,3 +361,70 @@ class StepFuncProjectStack(Stack):
             lambda_error_handler,
         ]:
             fn.grant_invoke(state_machine.role)
+
+        #############################################################################
+        #  API Gateway  →  HTTP API (v2)  →  Step Functions StartExecution
+        #############################################################################
+
+        # 1️⃣ Create an HTTP API
+        http_api = apigwv2.HttpApi(self, "StepFuncProjectHttpApi")
+
+        # 2️⃣ Give API Gateway permission to call StartExecution on your state machine
+        api_gw_role = iam.Role(
+            self,
+            "HttpApiStepFunctionsRole",
+            assumed_by=iam.ServicePrincipal("apigateway.amazonaws.com"),
+        )
+        state_machine.grant_start_execution(api_gw_role)
+
+        """
+        This explains the data flow from the client API call to the first Lambda.
+
+        A client does:
+
+        curl -X POST 'https://{api-id}.execute-api.eu-west-2.amazonaws.com/invoke' \
+            -H 'Content-Type: application/json' \
+            -d '{"task":"sync", "data":"some-value"}'
+
+        HTTP API calls the AWS 'StartExecution' API with a payload like this:
+        (Note how the 'Input' field is a stringified version of the client's JSON)
+
+        {
+            "Input": "{\"task\":\"sync\", \"data\":\"some-value\"}",
+            "StateMachineArn": "arn:aws:states:..."
+        }
+
+        Step Functions then parses the "Input" string. Because the first Lambda task
+        is configured to receive the entire state (`$`), the Lambda's 'event' will be
+        the original JSON object sent by the client:
+
+        {
+            "task": "sync",
+            "data": "some-value"
+        }
+        """
+
+        # 3️⃣ Define the Step Functions integration
+        start_exec_integration = integ.HttpStepFunctionsIntegration(
+            "StartSFIntegration",
+            state_machine=state_machine,
+            parameter_mapping=apigwv2.ParameterMapping()
+            # The 'StartExecution' API requires the 'Input' parameter (capital "I").
+            .custom("Input", "$request.body")
+            # The 'StartExecution' API also requires the 'StateMachineArn'.
+            .custom("StateMachineArn", state_machine.state_machine_arn),
+        )
+
+        # 4️⃣ Wire up POST /invoke
+        http_api.add_routes(
+            path="/invoke",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=start_exec_integration,
+        )
+
+        """
+        to do
+        What You Need Instead: Slack Request Verification
+
+        While you don't need CORS, you absolutely must implement a different security mechanism to ensure that the requests hitting your API are genuinely from Slack and not from a malicious actor.
+        """
