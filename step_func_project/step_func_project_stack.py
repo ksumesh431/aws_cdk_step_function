@@ -427,4 +427,6 @@ class StepFuncProjectStack(Stack):
         What You Need Instead: Slack Request Verification
 
         While you don't need CORS, you absolutely must implement a different security mechanism to ensure that the requests hitting your API are genuinely from Slack and not from a malicious actor.
+
+        also change names of resources
         """
