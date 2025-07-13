@@ -97,8 +97,7 @@ class StepFuncProjectStack(Stack):
             max_allocated_storage=30,
             multi_az=False,
             publicly_accessible=False,
-            credentials=rds.Credentials.from_generated_secret("postgres"),
-            removal_policy=RemovalPolicy.DESTROY,
+            credentials=rds.Credentials.from_generated_secret("postgres", secret_name="rds_postgres_creds_stepfuncproject"),
             deletion_protection=False,
             iam_authentication=True,
         )
