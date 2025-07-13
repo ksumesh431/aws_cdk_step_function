@@ -17,7 +17,7 @@ def get_engine(secret: dict):
     password = secret["password"]
     host = secret.get("host")
     port = secret.get("port")
-    dbname = "postgres"  # Hardcoded for simplicity, can be changed as needed
+    dbname = os.environ.get("DB_NAME", "postgres")
 
     url = f"postgresql+pg8000://{user}:{password}@{host}:{port}/{dbname}"
     return create_engine(url, pool_pre_ping=True, future=True)

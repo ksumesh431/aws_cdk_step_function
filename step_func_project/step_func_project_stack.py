@@ -29,11 +29,11 @@ class StepFuncProjectStack(Stack):
         # Use existing vpc
         vpc = ec2.Vpc.from_lookup(
             self,
-            "ExistingVpc",
+            "Existing_Vpc_stepfuncproject",
             vpc_id="vpc-0e01c3c7ae69fd92b",  #  <-- your real VPC ID here
         )
 
-        # import the two subnets by ID
+        # import the two subnets by ID (atleast two subnets in different zones is required for RDS)
         priv_subnet_1 = ec2.Subnet.from_subnet_attributes(
             self,
             "PrivSubnet1",
@@ -53,7 +53,7 @@ class StepFuncProjectStack(Stack):
         # Create a security group for the RDS instance
         rds_sg = ec2.SecurityGroup(
             self,
-            "StepFuncProjectRdsSG",
+            "Rds_SG_stepfuncproject",
             vpc=vpc,
             description="Allow PostgreSQL access",
             allow_all_outbound=True,
@@ -62,7 +62,7 @@ class StepFuncProjectStack(Stack):
         # Security Group for Lambda Functions
         lambda_sg = ec2.SecurityGroup(
             self,
-            "LambdaSecurityGroup",
+            "lambda_SG_stepfuncproject",
             vpc=vpc,  # the existing VPC you imported
             description="Outbound to RDS",
             allow_all_outbound=True,
@@ -79,7 +79,8 @@ class StepFuncProjectStack(Stack):
         #################################################
         db_instance = rds.DatabaseInstance(
             self,
-            "StepFuncProjectPostgres",
+            "rds_postgres_stepfuncproject",
+            database_name="postgres_db_stepfuncproject",
             engine=rds.DatabaseInstanceEngine.postgres(
                 version=rds.PostgresEngineVersion.VER_17_5
             ),
@@ -107,7 +108,7 @@ class StepFuncProjectStack(Stack):
         #################################################
         role = iam.Role(
             self,
-            "LambdaExecutionRole",
+            "lambda_role_stepfuncproject",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             managed_policies=[
                 # ➊ VPC-ENI permissions
@@ -136,7 +137,7 @@ class StepFuncProjectStack(Stack):
         #################################################
         layer = lambda_.LayerVersion(
             self,
-            "helper_layer",
+            "layer_stepfuncproject",
             code=lambda_.Code.from_asset("layer"),
             description="Common helper utility",
             compatible_runtimes=[lambda_.Runtime.PYTHON_3_13],
@@ -148,27 +149,27 @@ class StepFuncProjectStack(Stack):
         #################################################
         lambda_configs = [
             {
-                "id": "StepFuncProject_LambdaFunction_1",
+                "id": "LambdaFunction_1_stepfuncproject",
                 "desc": "1st Lambda in the step functions to interact with RDS",
-                "name": "StepFuncProject_LambdaFunction_1",
+                "name": "LambdaFunction_1_stepfuncproject",
                 "asset": "lambdas/lambda_1",
             },
             {
-                "id": "StepFuncProject_LambdaFunction_2",
+                "id": "LambdaFunction_2_stepfuncproject",
                 "desc": None,
-                "name": "StepFuncProject_LambdaFunction_2",
+                "name": "LambdaFunction_2_stepfuncproject",
                 "asset": "lambdas/lambda_2",
             },
             {
-                "id": "StepFuncProject_LambdaFunction_3",
+                "id": "LambdaFunction_3_stepfuncproject",
                 "desc": None,
-                "name": "StepFuncProject_LambdaFunction_3",
+                "name": "LambdaFunction_3_stepfuncproject",
                 "asset": "lambdas/lambda_3",
             },
             {
-                "id": "StepFuncProject_LambdaErrorHandler",
+                "id": "LambdaErrorHandler_stepfuncproject",
                 "desc": "Lambda function to handle errors in the step functions",
-                "name": "StepFuncProject_LambdaErrorHandler",
+                "name": "LambdaErrorHandler_stepfuncproject",
                 "asset": "lambdas/lambda_error_handler",
             },
         ]
@@ -198,7 +199,10 @@ class StepFuncProjectStack(Stack):
                 vpc_subnets=ec2.SubnetSelection(  # optional; keeps them in the NAT gateway subnets
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
                 ),
-                environment={"DB_SECRET_ARN": db_instance.secret.secret_arn},
+                environment={
+                    "DB_SECRET_ARN": db_instance.secret.secret_arn,
+                    "DB_NAME": "postgres_db_stepfuncproject",
+                },
                 **kwargs,
             )
             lambda_functions.append(fn)
@@ -217,15 +221,6 @@ class StepFuncProjectStack(Stack):
                 fn
             )  # This allows the Lambda functions to read the database credentials
 
-        # #################################################
-        # # API Gateway
-        # #################################################
-        # api = apigateway.RestApi(self, "StepFuncProjectApi")
-        # invoke_resource = api.root.add_resource("invoke")
-        # invoke_resource.add_method(
-        #     "POST", apigateway.LambdaIntegration(lambda_function_1)
-        # )
-
         #################################################
         # Step Functions State Machine
         #################################################
@@ -233,7 +228,7 @@ class StepFuncProjectStack(Stack):
         # 1️⃣ Lambda-invoke tasks ---------------------------------------------------
         invoke_1 = tasks.LambdaInvoke(
             self,
-            "Lambda Invoke 1",
+            "Lambda_Invoke_1_stepfuncproject",
             lambda_function=lambda_function_1,
             payload=sfn.TaskInput.from_json_path_at("$"),
             output_path="$.Payload",
@@ -252,7 +247,7 @@ class StepFuncProjectStack(Stack):
 
         invoke_2 = tasks.LambdaInvoke(
             self,
-            "Lambda Invoke 2",
+            "Lambda_Invoke_2_stepfuncproject",
             lambda_function=lambda_function_2,
             payload=sfn.TaskInput.from_json_path_at("$"),
             output_path="$.Payload",
@@ -271,7 +266,7 @@ class StepFuncProjectStack(Stack):
 
         invoke_3 = tasks.LambdaInvoke(
             self,
-            "Lambda Invoke 3",
+            "Lambda_Invoke_3_stepfuncproject",
             lambda_function=lambda_function_3,
             payload=sfn.TaskInput.from_json_path_at("$"),
             output_path="$.Payload",
@@ -293,7 +288,7 @@ class StepFuncProjectStack(Stack):
 
         error_handler_task = tasks.LambdaInvoke(
             self,
-            "Lambda error handler",
+            "Lambda_error_handler_invoke_stepfuncproject",
             lambda_function=lambda_error_handler,
             #  ⬇️  Pass extra context so the Slack msg can say what blew up
             payload=sfn.TaskInput.from_object(
@@ -326,19 +321,19 @@ class StepFuncProjectStack(Stack):
 
         # 3️⃣ Choice states ----------------------------------------------------------
         choice_3 = (
-            sfn.Choice(self, "Choice 3")
+            sfn.Choice(self, "Choice_3_stepfuncproject")
             .when(sfn.Condition.boolean_equals("$.success", False), error_branch)
             .otherwise(sfn.Succeed(self, "Success"))
         )
 
         choice_2 = (
-            sfn.Choice(self, "Choice 2")
+            sfn.Choice(self, "Choice_2_stepfuncproject")
             .when(sfn.Condition.boolean_equals("$.success", False), error_branch)
             .otherwise(invoke_3.next(choice_3))
         )
 
         choice_1 = (
-            sfn.Choice(self, "Choice 1")
+            sfn.Choice(self, "Choice_1_stepfuncproject")
             .when(sfn.Condition.boolean_equals("$.success", False), error_branch)
             .otherwise(invoke_2.next(choice_2))
         )
@@ -348,7 +343,7 @@ class StepFuncProjectStack(Stack):
 
         state_machine = sfn.StateMachine(
             self,
-            "StepFuncProjectStateMachine",
+            "StateMachine_stepfuncproject",
             definition_body=sfn.DefinitionBody.from_chainable(definition),
             timeout=Duration.minutes(5),
         )
@@ -367,7 +362,10 @@ class StepFuncProjectStack(Stack):
         #############################################################################
 
         # 1️⃣ Create an HTTP API
-        http_api = apigwv2.HttpApi(self, "StepFuncProjectHttpApi")
+        http_api = apigwv2.HttpApi(
+            self,
+            "HttpApi_stepfuncproject",
+        )
 
         # 2️⃣ Give API Gateway permission to call StartExecution on your state machine
         api_gw_role = iam.Role(
@@ -406,7 +404,7 @@ class StepFuncProjectStack(Stack):
 
         # 3️⃣ Define the Step Functions integration
         start_exec_integration = integ.HttpStepFunctionsIntegration(
-            "StartSFIntegration",
+            "Start_SF_Integration_stepfuncproject",
             state_machine=state_machine,
             parameter_mapping=apigwv2.ParameterMapping()
             # The 'StartExecution' API requires the 'Input' parameter (capital "I").

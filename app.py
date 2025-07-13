@@ -9,6 +9,7 @@ from step_func_project.step_func_project_stack import StepFuncProjectStack
 app = cdk.App()
 Tags.of(app).add("created_by", "cdk")
 Tags.of(app).add("project", "step-function-project")
+Tags.of(app).add("AppManagerCFNStackKey", "step-function-project") # for aws cost explorer
 StepFuncProjectStack(app, "StepFuncProjectStack",
     # If you don't specify 'env', this stack will be environment-agnostic.
     # Account/Region-dependent features and context lookups will not work,
