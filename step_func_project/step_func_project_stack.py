@@ -128,6 +128,10 @@ class StepFuncProjectStack(Stack):
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "CloudWatchFullAccessV2"
                 ),
+                # ➏ Secrets Manager full access
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "SecretsManagerReadWrite"
+                ),
             ],
         )
 
@@ -194,7 +198,7 @@ class StepFuncProjectStack(Stack):
                 vpc=vpc,
                 security_groups=[lambda_sg],
                 log_retention=logs.RetentionDays.TWO_YEARS,
-                timeout=Duration.seconds(30),
+                timeout=Duration.minutes(10),
                 vpc_subnets=ec2.SubnetSelection(  # optional; keeps them in the NAT gateway subnets
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
                 ),
@@ -344,7 +348,7 @@ class StepFuncProjectStack(Stack):
             self,
             "StateMachine_stepfuncproject",
             definition_body=sfn.DefinitionBody.from_chainable(definition),
-            timeout=Duration.minutes(5),
+            timeout=Duration.minutes(45),
         )
 
         # Allow Step Functions to call Lambdas

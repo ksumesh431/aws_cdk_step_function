@@ -1,17 +1,67 @@
-import os, json, uuid, datetime
+import os
+import json
+import datetime
+import requests
+
 import boto3
-from sqlalchemy import create_engine, Column, DateTime, Uuid
+from sqlalchemy import create_engine, Column, String, Float, DateTime
 from sqlalchemy.orm import declarative_base, Session
 
+# === SQLAlchemy Setup: Define the Database Table Model ===
 Base = declarative_base()
 
 
-class Demo(Base):
-    __tablename__ = "demo"
-    id = Column(Uuid, primary_key=True)
+# class PagerDutyIncident(Base):
+#     __tablename__ = "pagerduty_incidents"
+#     id = Column(String, primary_key=True)
+#     created_at = Column(DateTime(timezone=True), nullable=False)
+#     severity = Column(String)
+#     duration = Column(String)
+
+class PagerDutyIncident(Base):
+    __tablename__ = "pagerduty_incidents"
+
+    # --- Columns from First Lambda ---
+    id = Column(String, primary_key=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
+    severity = Column(String)
+    duration = Column(String)
+
+    # --- NEW: Last Updated Timestamp ---
+    last_updated = Column(DateTime(timezone=True))
+
+    # --- NEW Columns for Enriched Data (from reference code) ---
+    incident_summary = Column(String)
+    ack_noc_minutes = Column(Float)
+    escalate_noc_minutes = Column(Float)
+    ack_pythian_sre_minutes = Column(Float)
+    escalate_pythian_sre_minutes = Column(Float)
+    detect_time_minutes = Column(Float)
+    restore_time_minutes = Column(Float)
+    recover_time_minutes = Column(Float)
+    Engineering_time_spent_on_incident = Column(String)
+    Number_of_engineers = Column(String)
+    Entity = Column(String)
+    Platform = Column(String)
+    Customer_Experience = Column(String)
+    Incident_Category = Column(String)
+    incident_detection_type_auto = Column(String)
+    Pythian_resolution_without_lytx = Column(String)
+    Alert_Autoresolved = Column(String)
+
+    # Timestamps from timeline and custom fields
+    trigger_time = Column(DateTime(timezone=True))
+    noc_acknowledge_time = Column(DateTime(timezone=True))
+    noc_escalate_time = Column(DateTime(timezone=True))
+    pythian_sre_acknowledge_time = Column(DateTime(timezone=True))
+    pythian_sre_escalate_time = Column(DateTime(timezone=True))
+    Time_of_Detection = Column(DateTime(timezone=True))
+    Time_of_Resolution = Column(DateTime(timezone=True))
+    Time_of_Recovery = Column(DateTime(timezone=True))
 
 
+
+# === Database Connection Function ===
 def get_engine(secret: dict):
     user = secret["username"]
     password = secret["password"]
@@ -23,71 +73,148 @@ def get_engine(secret: dict):
     return create_engine(url, pool_pre_ping=True, future=True)
 
 
+# === PagerDuty Helper Functions ===
+def calculate_duration(start_time_str: str, end_time_str: str) -> str:
+    if not end_time_str:
+        return "Still Open"
+
+    start_dt = datetime.datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+    end_dt = datetime.datetime.fromisoformat(end_time_str.replace("Z", "+00:00"))
+    duration_delta = end_dt - start_dt
+
+    total_seconds = int(duration_delta.total_seconds())
+    days, remainder = divmod(total_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+
+    return " ".join(parts) if parts else "0m"
+
+
+def fetch_pagerduty_incidents(api_key: str, days: int = 30) -> list:
+    print(f"Fetching incidents from the last {days} days from PagerDuty...")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    since_time = now - datetime.timedelta(days=days)
+
+    headers = {
+        "Authorization": f"Token token={api_key}",
+        "Accept": "application/vnd.pagerduty+json;version=2",
+        "Content-Type": "application/json",
+    }
+    
+    # --- Pagination Logic ---
+    all_incidents = []
+    offset = 0
+    limit = 100 # The number of results to get per API call
+
+    while True:
+        params = {
+            "since": since_time.isoformat(),
+            "until": now.isoformat(),
+            "limit": limit,
+            "offset": offset
+        }
+
+        response = requests.get(
+            "https://api.pagerduty.com/incidents",
+            headers=headers,
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        json_response = response.json()
+        
+        # Add the fetched incidents to our master list
+        incidents_on_page = json_response.get("incidents", [])
+        if not incidents_on_page:
+            break # Stop if a page is empty for any reason
+
+        all_incidents.extend(incidents_on_page)
+
+        # Check if there are more pages to fetch
+        if not json_response.get("more"):
+            break # Exit the loop if the 'more' flag is false or missing
+
+        # Prepare for the next iteration
+        offset += limit
+        print(f"Fetched {len(all_incidents)} incidents so far, getting next page...")
+
+    return all_incidents
+
+# === AWS Secrets Manager Client ===
 secrets_client = boto3.client("secretsmanager")
-_secret_arn = os.environ["DB_SECRET_ARN"]
 
 
+# === Main Lambda Handler ===
 def lambda_handler(event, context):
     try:
-        print("=== Lambda received event ===")
-        print(json.dumps(event, indent=2, default=str))
+        print("=== PagerDuty Incident Ingestion Lambda Started ===")
 
-        secret = json.loads(
-            secrets_client.get_secret_value(SecretId=_secret_arn)["SecretString"]
+
+
+        # 1. Fetch PagerDuty API Key from AWS Secrets Manager
+        pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty")
+        pagerduty_secret = json.loads(pagerduty_secret_payload["SecretString"])
+        pagerduty_api_key = pagerduty_secret.get("PAGERDUTY_API_KEY")
+
+
+        if not pagerduty_api_key:
+            raise KeyError(
+                "Secret from Secrets Manager does not contain the key 'PAGERDUTY_API_KEY'"
+            )
+
+        # 2. Get Database Credentials from AWS Secrets Manager
+        db_secret_arn = os.environ["DB_SECRET_ARN"]
+        print(
+            f"Fetching Database credentials from Secrets Manager ARN: {db_secret_arn}"
         )
-        engine = get_engine(secret)
+        db_secret_payload = secrets_client.get_secret_value(SecretId=db_secret_arn)
+        db_secret = json.loads(db_secret_payload["SecretString"])
+
+        # 3. Connect to the Database and Create Table if it doesn't exist
+        engine = get_engine(db_secret)
         Base.metadata.create_all(engine)
 
-        new_row_id = uuid.uuid4()
+        # 4. Fetch Incidents from PagerDuty API
+        incidents = fetch_pagerduty_incidents(pagerduty_api_key)
+        if not incidents:
+            print("No new incidents found in PagerDuty.")
+            return {"success": True, "message": "No new incidents found."}
 
-        # === TRANSACTION 1: THE WRITE ===
-        # We use a 'try' block just for the write operation.
-        try:
-            with Session(engine) as session:
-                new_row = Demo(
-                    id=new_row_id,
-                    created_at=datetime.datetime.now(datetime.timezone.utc),
-                )
-                session.add(new_row)
-                session.commit()
-                print(f"DEBUG: 'commit' was called for ID: {new_row_id}")
-        except Exception as e:
-            # If the commit itself fails, we'll see this error.
-            raise RuntimeError(f"Database WRITE operation failed: {e}")
+        print(
+            f"Fetched {len(incidents)} incidents from PagerDuty. Processing for database."
+        )
 
-        # === TRANSACTION 2: THE VERIFICATION READ ===
-        # We now create a brand new session to verify the write.
-        # This forces a real database query and bypasses the cache of the first session.
-        latest = None
+        # 5. Process and Save Incidents to the Database
         with Session(engine) as session:
-            print(f"DEBUG: Attempting to read back ID {new_row_id} in a NEW session.")
-            # session.get is the most efficient way to query by primary key.
-            latest = session.get(Demo, new_row_id)
+            for incident_data in incidents:
+                incident_to_save = PagerDutyIncident(
+                    id=incident_data.get("id"),
+                    created_at=datetime.datetime.fromisoformat(
+                        incident_data.get("created_at").replace("Z", "+00:00")
+                    ),
+                    severity=(incident_data.get("priority") or {}).get(
+                        "summary", "N/A"
+                    ),
+                    duration=calculate_duration(
+                        incident_data.get("created_at"),
+                        incident_data.get("resolved_at"),
+                    ),
+                )
+                session.merge(incident_to_save)
+            session.commit()
 
-        # === THE VERDICT ===
-        if not latest:
-            # If 'latest' is None, it PROVES the first transaction was rolled back.
-            print(
-                "!!! CRITICAL FAILURE: Row was NOT found after commit. Transaction was rolled back. !!!"
-            )
-            raise RuntimeError(
-                "Data verification failed. The row was not found in the database after the commit call."
-            )
-
-        print("SUCCESS: Row was written and verified in a separate transaction.")
-        return {
-            "success": True,
-            "row": {
-                "id": str(latest.id),
-                "created_at": latest.created_at.isoformat() + "Z",
-            },
-        }
+        print(f"SUCCESS: Processed and saved/updated {len(incidents)} incidents.")
+        return {"success": True, "incidents_processed": len(incidents)}
 
     except Exception as exc:
-        print(f"Error: {exc}")
-        return {
-            "success": False,
-            "error": str(exc),
-            "type": exc.__class__.__name__,
-            "error_from": "Lambda 1",
-        }
+        error_message = f"An error occurred: {exc}"
+        print(error_message)
+        return {"success": False, "error": str(exc), "type": exc.__class__.__name__}
