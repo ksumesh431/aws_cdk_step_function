@@ -383,7 +383,7 @@ class StepFuncProjectStack(Stack):
             self,
             "HttpApi_Role_stepfuncproject",
             assumed_by=iam.ServicePrincipal("apigateway.amazonaws.com"),
-            role_name="HttpApi_Role_stepfuncproject",
+            role_name="HTTPApi_Role_stepfuncproject",
         )
         state_machine.grant_start_execution(api_gw_role)
 
