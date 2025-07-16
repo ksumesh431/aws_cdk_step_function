@@ -2,10 +2,10 @@ import os
 import json
 import datetime
 import requests
-import concurrent.futures # Import the concurrency library
+import concurrent.futures  # Import the concurrency library
 
 import boto3
-from sqlalchemy import create_engine, Column, String, DateTime, Float
+from sqlalchemy import create_engine, Index, Column, String, DateTime, Float
 from sqlalchemy.orm import declarative_base, Session
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -19,14 +19,21 @@ MAX_WORKERS = 15
 
 Base = declarative_base()
 
+
 class PagerDutyIncident(Base):
-    # ... (Your full model definition is perfect, no changes needed) ...
     __tablename__ = "pagerduty_incidents"
+    __table_args__ = (Index("ix_pdi_last_updated", "last_updated"),)
+
+    # --- Columns from First Lambda ---
     id = Column(String, primary_key=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
     severity = Column(String)
     duration = Column(String)
-    last_updated = Column(DateTime(timezone=True))
+
+    # --- NEW: Last Updated Timestamp ---
+    last_updated = Column(DateTime(timezone=True), index=True)
+
+    # --- NEW Columns for Enriched Data (from reference code) ---
     incident_summary = Column(String)
     ack_noc_minutes = Column(Float)
     escalate_noc_minutes = Column(Float)
@@ -44,6 +51,8 @@ class PagerDutyIncident(Base):
     incident_detection_type_auto = Column(String)
     Pythian_resolution_without_lytx = Column(String)
     Alert_Autoresolved = Column(String)
+
+    # Timestamps from timeline and custom fields
     trigger_time = Column(DateTime(timezone=True))
     noc_acknowledge_time = Column(DateTime(timezone=True))
     noc_escalate_time = Column(DateTime(timezone=True))
@@ -56,10 +65,16 @@ class PagerDutyIncident(Base):
 
 def get_engine(secret: dict):
     # ... (No changes needed) ...
-    user, password, host, port = secret["username"], secret["password"], secret.get("host"), secret.get("port")
+    user, password, host, port = (
+        secret["username"],
+        secret["password"],
+        secret.get("host"),
+        secret.get("port"),
+    )
     dbname = os.environ.get("DB_NAME", "postgres")
     url = f"postgresql+pg8000://{user}:{password}@{host}:{port}/{dbname}"
     return create_engine(url, pool_pre_ping=True, future=True)
+
 
 # ==============================================================================
 # === PAGERDUTY CORE LOGIC (FROM YOUR REFERENCE CODE) ===
@@ -290,7 +305,9 @@ def process_single_incident(incident_id, api_key):
 
     return db_update_data
 
+
 secrets_client = boto3.client("secretsmanager")
+
 
 # === REFACTORED Main Lambda Handler ===
 def lambda_handler(event, context):
@@ -299,7 +316,9 @@ def lambda_handler(event, context):
 
         # --- 1. Setup: Get secrets and DB engine (same as before) ---
         pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty")
-        pagerduty_api_key = json.loads(pagerduty_secret_payload["SecretString"])["PAGERDUTY_API_KEY"]
+        pagerduty_api_key = json.loads(pagerduty_secret_payload["SecretString"])[
+            "PAGERDUTY_API_KEY"
+        ]
 
         db_secret_arn = os.environ["DB_SECRET_ARN"]
         db_secret_payload = secrets_client.get_secret_value(SecretId=db_secret_arn)
@@ -325,14 +344,18 @@ def lambda_handler(event, context):
 
         # Extract just the IDs to pass to the workers
         incident_ids = [incident.id for incident in incidents_to_enrich]
-        print(f"Found {len(incident_ids)} incidents to enrich. Starting parallel processing.")
+        print(
+            f"Found {len(incident_ids)} incidents to enrich. Starting parallel processing."
+        )
 
         # --- 3. Process incidents in parallel ---
         all_enriched_data = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             # Create a future for each incident ID. We pass the API key to the worker.
             future_to_id = {
-                executor.submit(process_single_incident, incident_id, pagerduty_api_key): incident_id
+                executor.submit(
+                    process_single_incident, incident_id, pagerduty_api_key
+                ): incident_id
                 for incident_id in incident_ids
             }
 
@@ -350,18 +373,23 @@ def lambda_handler(event, context):
 
         if not all_enriched_data:
             print("No incidents were successfully enriched.")
-            return {"success": True, "message": "No incidents were successfully enriched."}
+            return {
+                "success": True,
+                "message": "No incidents were successfully enriched.",
+            }
 
         # --- 4. Update the database in a single transaction ---
         updated_count = 0
         with Session(engine) as session:
-            print(f"Updating {len(all_enriched_data)} enriched incidents in the database...")
+            print(
+                f"Updating {len(all_enriched_data)} enriched incidents in the database..."
+            )
             for data in all_enriched_data:
                 # Add the last_updated timestamp just before saving
                 data["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
                 session.merge(PagerDutyIncident(**data))
                 updated_count += 1
-            session.commit() # Commit all updates at once
+            session.commit()  # Commit all updates at once
 
         print(f"SUCCESS: Processed and updated {updated_count} incidents.")
         return {"success": True, "incidents_updated": updated_count}

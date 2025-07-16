@@ -14,6 +14,7 @@ from aws_cdk import (
     aws_apigatewayv2_integrations as integ,
 )
 from constructs import Construct
+from aws_cdk import CfnOutput
 
 
 class StepFuncProjectStack(Stack):
@@ -30,7 +31,7 @@ class StepFuncProjectStack(Stack):
         vpc = ec2.Vpc.from_lookup(
             self,
             "Existing_Vpc_stepfuncproject",
-            vpc_id="vpc-0e01c3c7ae69fd92b",  #  <-- your real VPC ID here
+            vpc_id="vpc-0e01c3c7ae69fd92b",
         )
 
         # import the two subnets by ID (atleast two subnets in different zones is required for RDS)
@@ -54,6 +55,7 @@ class StepFuncProjectStack(Stack):
         rds_sg = ec2.SecurityGroup(
             self,
             "Rds_SG_stepfuncproject",
+            security_group_name="Rds_SG_stepfuncproject",
             vpc=vpc,
             description="Allow PostgreSQL access",
             allow_all_outbound=True,
@@ -63,6 +65,7 @@ class StepFuncProjectStack(Stack):
         lambda_sg = ec2.SecurityGroup(
             self,
             "lambda_SG_stepfuncproject",
+            security_group_name="lambda_SG_stepfuncproject",
             vpc=vpc,  # the existing VPC you imported
             description="Outbound to RDS",
             allow_all_outbound=True,
@@ -97,9 +100,12 @@ class StepFuncProjectStack(Stack):
             max_allocated_storage=30,
             multi_az=False,
             publicly_accessible=False,
-            credentials=rds.Credentials.from_generated_secret("postgres", secret_name="rds_postgres_creds_stepfuncproject"),
+            credentials=rds.Credentials.from_generated_secret(
+                "postgres", secret_name="rds_postgres_creds_stepfuncproject"
+            ),
             deletion_protection=False,
             iam_authentication=True,
+            # storage_encrypted=True, # Optional, but recommended
         )
 
         #################################################
@@ -108,6 +114,7 @@ class StepFuncProjectStack(Stack):
         role = iam.Role(
             self,
             "lambda_role_stepfuncproject",
+            role_name="lambda_role_stepfuncproject",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             managed_policies=[
                 # ➊ VPC-ENI permissions
@@ -153,19 +160,19 @@ class StepFuncProjectStack(Stack):
         lambda_configs = [
             {
                 "id": "LambdaFunction_1_stepfuncproject",
-                "desc": "1st Lambda in the step functions to interact with RDS",
+                "desc": "1st Lambda in the step functions to fetch Pagerduty data and create absic db schema with few columns data population.",
                 "name": "LambdaFunction_1_stepfuncproject",
                 "asset": "lambdas/lambda_1",
             },
             {
                 "id": "LambdaFunction_2_stepfuncproject",
-                "desc": None,
+                "desc": "2nd Lambda in the step functions to fetch Pagerduty complete indident data and populate everything in the database.",
                 "name": "LambdaFunction_2_stepfuncproject",
                 "asset": "lambdas/lambda_2",
             },
             {
                 "id": "LambdaFunction_3_stepfuncproject",
-                "desc": None,
+                "desc": "3rd Lambda in the step functions to validate data from the database.",
                 "name": "LambdaFunction_3_stepfuncproject",
                 "asset": "lambdas/lambda_3",
             },
@@ -199,7 +206,7 @@ class StepFuncProjectStack(Stack):
                 security_groups=[lambda_sg],
                 log_retention=logs.RetentionDays.TWO_YEARS,
                 timeout=Duration.minutes(10),
-                vpc_subnets=ec2.SubnetSelection(  # optional; keeps them in the NAT gateway subnets
+                vpc_subnets=ec2.SubnetSelection(  # must keep in subnet with nat gateway egress
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
                 ),
                 environment={
@@ -219,10 +226,9 @@ class StepFuncProjectStack(Stack):
 
         # Allow Lambdas to connect to the database
         for fn in [lambda_function_1, lambda_function_2, lambda_function_3]:
-            # db_instance.grant_connect(fn) # This allows the Lambda functions to connect to the database using IAM authentication
-            db_instance.secret.grant_read(
-                fn
-            )  # This allows the Lambda functions to read the database credentials
+            # db_instance.grant_connect(fn) # iam auth
+            # This allows the Lambda functions to read the database credentials
+            db_instance.secret.grant_read(fn)
 
         #################################################
         # Step Functions State Machine
@@ -347,6 +353,7 @@ class StepFuncProjectStack(Stack):
         state_machine = sfn.StateMachine(
             self,
             "StateMachine_stepfuncproject",
+            state_machine_name="StateMachine_stepfuncproject",
             definition_body=sfn.DefinitionBody.from_chainable(definition),
             timeout=Duration.minutes(45),
         )
@@ -368,15 +375,45 @@ class StepFuncProjectStack(Stack):
         http_api = apigwv2.HttpApi(
             self,
             "HttpApi_stepfuncproject",
+            api_name="HttpApi_stepfuncproject",
         )
 
         # 2️⃣ Give API Gateway permission to call StartExecution on your state machine
         api_gw_role = iam.Role(
             self,
-            "HttpApiStepFunctionsRole",
+            "HttpApi_Role_stepfuncproject",
             assumed_by=iam.ServicePrincipal("apigateway.amazonaws.com"),
+            role_name="HttpApi_Role_stepfuncproject",
         )
         state_machine.grant_start_execution(api_gw_role)
+
+        # 3️⃣ Define the Step Functions integration
+        start_exec_integration = integ.HttpStepFunctionsIntegration(
+            "Start_SF_Integration_stepfuncproject",
+            state_machine=state_machine,
+            parameter_mapping=apigwv2.ParameterMapping()
+            # The 'StartExecution' API requires the 'Input' parameter (capital "I").
+            .custom("Input", "$request.body")
+            # The 'StartExecution' API also requires the 'StateMachineArn'.
+            .custom("StateMachineArn", state_machine.state_machine_arn),
+        )
+
+        # 4️⃣ Wire up POST /invoke
+        http_api.add_routes(
+            path="/invoke",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=start_exec_integration,
+        )
+
+        # Output the HTTP API endpoint URL
+
+        CfnOutput(
+            self,
+            "HttpApiEndpoint_stepfuncproject",
+            value=http_api.api_endpoint,
+            description="HTTP API endpoint for Step Functions project",
+            export_name="HttpApiEndpoint-stepfuncproject",
+        )
 
         """
         This explains the data flow from the client API call to the first Lambda.
@@ -404,24 +441,6 @@ class StepFuncProjectStack(Stack):
             "data": "some-value"
         }
         """
-
-        # 3️⃣ Define the Step Functions integration
-        start_exec_integration = integ.HttpStepFunctionsIntegration(
-            "Start_SF_Integration_stepfuncproject",
-            state_machine=state_machine,
-            parameter_mapping=apigwv2.ParameterMapping()
-            # The 'StartExecution' API requires the 'Input' parameter (capital "I").
-            .custom("Input", "$request.body")
-            # The 'StartExecution' API also requires the 'StateMachineArn'.
-            .custom("StateMachineArn", state_machine.state_machine_arn),
-        )
-
-        # 4️⃣ Wire up POST /invoke
-        http_api.add_routes(
-            path="/invoke",
-            methods=[apigwv2.HttpMethod.POST],
-            integration=start_exec_integration,
-        )
 
         """
         to do

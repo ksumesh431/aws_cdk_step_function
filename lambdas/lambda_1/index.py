@@ -2,24 +2,26 @@ import os
 import json
 import datetime
 import requests
-
 import boto3
-from sqlalchemy import create_engine, Column, String, Float, DateTime
+from sqlalchemy import (
+    create_engine,
+    Index,
+    Column,
+    String,
+    Float,
+    DateTime,
+    Table,
+    MetaData,
+)
 from sqlalchemy.orm import declarative_base, Session
 
 # === SQLAlchemy Setup: Define the Database Table Model ===
 Base = declarative_base()
 
 
-# class PagerDutyIncident(Base):
-#     __tablename__ = "pagerduty_incidents"
-#     id = Column(String, primary_key=True)
-#     created_at = Column(DateTime(timezone=True), nullable=False)
-#     severity = Column(String)
-#     duration = Column(String)
-
 class PagerDutyIncident(Base):
     __tablename__ = "pagerduty_incidents"
+    __table_args__ = (Index("ix_pdi_last_updated", "last_updated"),)
 
     # --- Columns from First Lambda ---
     id = Column(String, primary_key=True)
@@ -28,7 +30,7 @@ class PagerDutyIncident(Base):
     duration = Column(String)
 
     # --- NEW: Last Updated Timestamp ---
-    last_updated = Column(DateTime(timezone=True))
+    last_updated = Column(DateTime(timezone=True), index=True)
 
     # --- NEW Columns for Enriched Data (from reference code) ---
     incident_summary = Column(String)
@@ -58,7 +60,6 @@ class PagerDutyIncident(Base):
     Time_of_Detection = Column(DateTime(timezone=True))
     Time_of_Resolution = Column(DateTime(timezone=True))
     Time_of_Recovery = Column(DateTime(timezone=True))
-
 
 
 # === Database Connection Function ===
@@ -108,18 +109,18 @@ def fetch_pagerduty_incidents(api_key: str, days: int = 30) -> list:
         "Accept": "application/vnd.pagerduty+json;version=2",
         "Content-Type": "application/json",
     }
-    
+
     # --- Pagination Logic ---
     all_incidents = []
     offset = 0
-    limit = 100 # The number of results to get per API call
+    limit = 100  # The number of results to get per API call
 
     while True:
         params = {
             "since": since_time.isoformat(),
             "until": now.isoformat(),
             "limit": limit,
-            "offset": offset
+            "offset": offset,
         }
 
         response = requests.get(
@@ -130,23 +131,24 @@ def fetch_pagerduty_incidents(api_key: str, days: int = 30) -> list:
         )
         response.raise_for_status()
         json_response = response.json()
-        
+
         # Add the fetched incidents to our master list
         incidents_on_page = json_response.get("incidents", [])
         if not incidents_on_page:
-            break # Stop if a page is empty for any reason
+            break  # Stop if a page is empty for any reason
 
         all_incidents.extend(incidents_on_page)
 
         # Check if there are more pages to fetch
         if not json_response.get("more"):
-            break # Exit the loop if the 'more' flag is false or missing
+            break  # Exit the loop if the 'more' flag is false or missing
 
         # Prepare for the next iteration
         offset += limit
         print(f"Fetched {len(all_incidents)} incidents so far, getting next page...")
 
     return all_incidents
+
 
 # === AWS Secrets Manager Client ===
 secrets_client = boto3.client("secretsmanager")
@@ -157,13 +159,10 @@ def lambda_handler(event, context):
     try:
         print("=== PagerDuty Incident Ingestion Lambda Started ===")
 
-
-
         # 1. Fetch PagerDuty API Key from AWS Secrets Manager
         pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty")
         pagerduty_secret = json.loads(pagerduty_secret_payload["SecretString"])
         pagerduty_api_key = pagerduty_secret.get("PAGERDUTY_API_KEY")
-
 
         if not pagerduty_api_key:
             raise KeyError(
@@ -181,6 +180,20 @@ def lambda_handler(event, context):
         # 3. Connect to the Database and Create Table if it doesn't exist
         engine = get_engine(db_secret)
         Base.metadata.create_all(engine)
+
+        ###################################################################
+        ################ code to set last_updated as index ################
+        # reflect just that one table
+        meta = MetaData()
+        tbl = Table("pagerduty_incidents", meta, autoload_with=engine)
+
+        # define your index
+        idx = Index("ix_pdi_last_updated", tbl.c.last_updated)
+
+        # create only if it doesn't exist already
+        idx.create(bind=engine, checkfirst=True)
+        ################ code to set last_updated as index ################
+        ###################################################################
 
         # 4. Fetch Incidents from PagerDuty API
         incidents = fetch_pagerduty_incidents(pagerduty_api_key)
