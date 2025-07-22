@@ -12,87 +12,121 @@ from aws_cdk import (
     aws_logs as logs,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as integ,
+    CfnOutput,
 )
 from constructs import Construct
-from aws_cdk import CfnOutput
+from typing import List, Dict, Any
 
 
 class StepFuncProjectStack(Stack):
+    """
+    AWS CDK Stack for a Step Functions project with Lambda functions,
+    RDS PostgreSQL database, and API Gateway integration.
+    """
+
+    # Class constants
+    PROJECT_NAME = "stepfuncproject"
+    DB_NAME = f"postgres_db_{PROJECT_NAME}"
+    SECRET_NAME = f"rds_postgres_creds_{PROJECT_NAME}"
+    POSTGRES_PORT = 5432
+    LAMBDA_TIMEOUT_MINUTES = 10
+    STATE_MACHINE_TIMEOUT_MINUTES = 45
+    VPC_ID = "vpc-0e01c3c7ae69fd92b"
+
+    # Subnet configuration
+    SUBNET_CONFIG = {
+        "private_subnet_1": {
+            "subnet_id": "subnet-0e2842b86fa358d19",
+            "availability_zone": "eu-west-2c",
+            "route_table_id": "rtb-091951509bec3c07f",
+        },
+        "private_subnet_2": {
+            "subnet_id": "subnet-0ff5a9d643e0b97c8",
+            "availability_zone": "eu-west-2b",
+            "route_table_id": "rtb-091951509bec3c07f",
+        },
+    }
+
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        #################################################
-        # Networking (VPC & Security Groups)
-        #################################################
-        # Create a VPC for the RDS instance
-        # vpc = ec2.Vpc(self, "StepFuncProjectVpc", max_azs=2)
+        # Create infrastructure components
+        self.vpc = self._create_vpc()
+        self.subnets = self._create_subnets()
+        self.security_groups = self._create_security_groups()
+        self.database = self._create_database()
+        self.iam_role = self._create_iam_role()
+        self.lambda_layer = self._create_lambda_layer()
+        self.lambda_functions = self._create_lambda_functions()
+        self.state_machine = self._create_state_machine()
+        self.api_gateway = self._create_api_gateway()
 
-        # Use existing vpc
-        vpc = ec2.Vpc.from_lookup(
+        self._create_outputs()
+
+    def _create_vpc(self) -> ec2.IVpc:
+        """Create or import existing VPC."""
+        return ec2.Vpc.from_lookup(
             self,
-            "Existing_Vpc_stepfuncproject",
-            vpc_id="vpc-0e01c3c7ae69fd92b",
+            f"Existing_Vpc_{self.PROJECT_NAME}",
+            vpc_id=self.VPC_ID,
         )
 
-        # import the two subnets by ID (atleast two subnets in different zones is required for RDS)
-        priv_subnet_1 = ec2.Subnet.from_subnet_attributes(
-            self,
-            "PrivSubnet1",
-            subnet_id="subnet-0e2842b86fa358d19",
-            availability_zone="eu-west-2c",  # required param
-            route_table_id="rtb-091951509bec3c07f",
-        )
+    def _create_subnets(self) -> Dict[str, ec2.ISubnet]:
+        """Create subnet references from existing subnets."""
+        subnets = {}
+        for name, config in self.SUBNET_CONFIG.items():
+            subnets[name] = ec2.Subnet.from_subnet_attributes(
+                self,
+                f"{name.title()}_{self.PROJECT_NAME}",
+                subnet_id=config["subnet_id"],
+                availability_zone=config["availability_zone"],
+                route_table_id=config["route_table_id"],
+            )
+        return subnets
 
-        priv_subnet_2 = ec2.Subnet.from_subnet_attributes(
-            self,
-            "PrivSubnet2",
-            subnet_id="subnet-0ff5a9d643e0b97c8",
-            availability_zone="eu-west-2b",  # required param
-            route_table_id="rtb-091951509bec3c07f",
-        )
-
-        # Create a security group for the RDS instance
+    def _create_security_groups(self) -> Dict[str, ec2.SecurityGroup]:
+        """Create security groups for RDS and Lambda."""
+        # RDS Security Group
         rds_sg = ec2.SecurityGroup(
             self,
-            "Rds_SG_stepfuncproject",
-            security_group_name="Rds_SG_stepfuncproject",
-            vpc=vpc,
+            f"Rds_SG_{self.PROJECT_NAME}",
+            security_group_name=f"Rds_SG_{self.PROJECT_NAME}",
+            vpc=self.vpc,
             description="Allow PostgreSQL access",
             allow_all_outbound=True,
         )
 
-        # Security Group for Lambda Functions
+        # Lambda Security Group
         lambda_sg = ec2.SecurityGroup(
             self,
-            "lambda_SG_stepfuncproject",
-            security_group_name="lambda_SG_stepfuncproject",
-            vpc=vpc,  # the existing VPC you imported
+            f"lambda_SG_{self.PROJECT_NAME}",
+            security_group_name=f"lambda_SG_{self.PROJECT_NAME}",
+            vpc=self.vpc,
             description="Outbound to RDS",
             allow_all_outbound=True,
         )
 
+        # Allow Lambda to connect to RDS
         rds_sg.add_ingress_rule(
             peer=lambda_sg,
-            connection=ec2.Port.tcp(5432),
+            connection=ec2.Port.tcp(self.POSTGRES_PORT),
             description="Allow Lambda functions to reach Postgres",
         )
 
-        #################################################
-        # Database (Amazon RDS for PostgreSQL)
-        #################################################
-        db_instance = rds.DatabaseInstance(
+        return {"rds": rds_sg, "lambda": lambda_sg}
+
+    def _create_database(self) -> rds.DatabaseInstance:
+        """Create RDS PostgreSQL instance."""
+        return rds.DatabaseInstance(
             self,
-            "rds_postgres_stepfuncproject",
-            database_name="postgres_db_stepfuncproject",
+            f"rds_postgres_{self.PROJECT_NAME}",
+            database_name=self.DB_NAME,
             engine=rds.DatabaseInstanceEngine.postgres(
                 version=rds.PostgresEngineVersion.VER_17_5
             ),
-            vpc=vpc,
-            # vpc_subnets=ec2.SubnetSelection(
-            #     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
-            # ),
-            vpc_subnets=ec2.SubnetSelection(subnets=[priv_subnet_1, priv_subnet_2]),
-            security_groups=[rds_sg],
+            vpc=self.vpc,
+            vpc_subnets=ec2.SubnetSelection(subnets=list(self.subnets.values())),
+            security_groups=[self.security_groups["rds"]],
             instance_type=ec2.InstanceType.of(
                 ec2.InstanceClass.BURSTABLE4_GRAVITON, ec2.InstanceSize.MICRO
             ),
@@ -101,205 +135,163 @@ class StepFuncProjectStack(Stack):
             multi_az=False,
             publicly_accessible=False,
             credentials=rds.Credentials.from_generated_secret(
-                "postgres", secret_name="rds_postgres_creds_stepfuncproject"
+                "postgres", secret_name=self.SECRET_NAME
             ),
             deletion_protection=False,
             iam_authentication=True,
-            # storage_encrypted=True, # Optional, but recommended
+            # storage_encrypted=True,  # Enable encryption for security
         )
 
-        #################################################
-        # IAM Roles & Permissions
-        #################################################
-        role = iam.Role(
+    def _create_iam_role(self) -> iam.Role:
+        """Create IAM role for Lambda functions."""
+        return iam.Role(
             self,
-            "lambda_role_stepfuncproject",
-            role_name="lambda_role_stepfuncproject",
+            f"lambda_role_{self.PROJECT_NAME}",
+            role_name=f"lambda_role_{self.PROJECT_NAME}",
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
             managed_policies=[
-                # ➊ VPC-ENI permissions
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "service-role/AWSLambdaVPCAccessExecutionRole"
                 ),
-                # ➋ Basic logs (CreateLogGroup/Stream + PutLogEvents)
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "service-role/AWSLambdaBasicExecutionRole"
                 ),
-                # ➌ DB permissions
                 iam.ManagedPolicy.from_aws_managed_policy_name("AmazonRDSFullAccess"),
-                # ➍ Step Functions permissions
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "service-role/AWSLambdaRole"
                 ),
-                # ➎ Cloudwatch permissions
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "CloudWatchFullAccessV2"
                 ),
-                # ➏ Secrets Manager full access
                 iam.ManagedPolicy.from_aws_managed_policy_name(
                     "SecretsManagerReadWrite"
                 ),
             ],
         )
 
-        #################################################
-        # Lambda Layer
-        #################################################
-        layer = lambda_.LayerVersion(
+    def _create_lambda_layer(self) -> lambda_.LayerVersion:
+        """Create Lambda layer for shared dependencies."""
+        return lambda_.LayerVersion(
             self,
-            "layer_stepfuncproject",
+            f"layer_{self.PROJECT_NAME}",
             code=lambda_.Code.from_asset("layer"),
             description="Common helper utility",
             compatible_runtimes=[lambda_.Runtime.PYTHON_3_13],
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        #################################################
-        # Lambda Functions
-        #################################################
-        lambda_configs = [
+    def _get_lambda_configs(self) -> List[Dict[str, str]]:
+        """Get Lambda function configurations."""
+        return [
             {
-                "id": "LambdaFunction_1_stepfuncproject",
-                "desc": "1st Lambda in the step functions to fetch Pagerduty data and create absic db schema with few columns data population.",
-                "name": "LambdaFunction_1_stepfuncproject",
+                "id": f"LambdaFunction_1_{self.PROJECT_NAME}",
+                "description": "1st Lambda in the step functions to fetch Pagerduty data and create basic db schema with few columns data population.",
+                "name": f"LambdaFunction_1_{self.PROJECT_NAME}",
                 "asset": "lambdas/lambda_1",
             },
             {
-                "id": "LambdaFunction_2_stepfuncproject",
-                "desc": "2nd Lambda in the step functions to fetch Pagerduty complete indident data and populate everything in the database.",
-                "name": "LambdaFunction_2_stepfuncproject",
+                "id": f"LambdaFunction_2_{self.PROJECT_NAME}",
+                "description": "2nd Lambda in the step functions to fetch Pagerduty complete incident data and populate everything in the database.",
+                "name": f"LambdaFunction_2_{self.PROJECT_NAME}",
                 "asset": "lambdas/lambda_2",
             },
             {
-                "id": "LambdaFunction_3_stepfuncproject",
-                "desc": "3rd Lambda in the step functions to validate data from the database.",
-                "name": "LambdaFunction_3_stepfuncproject",
+                "id": f"LambdaFunction_3_{self.PROJECT_NAME}",
+                "description": "3rd Lambda in the step functions to validate data from the database.",
+                "name": f"LambdaFunction_3_{self.PROJECT_NAME}",
                 "asset": "lambdas/lambda_3",
             },
             {
-                "id": "LambdaErrorHandler_stepfuncproject",
-                "desc": "Lambda function to handle errors in the step functions",
-                "name": "LambdaErrorHandler_stepfuncproject",
+                "id": f"LambdaErrorHandler_{self.PROJECT_NAME}",
+                "description": "Lambda function to handle errors in the step functions",
+                "name": f"LambdaErrorHandler_{self.PROJECT_NAME}",
                 "asset": "lambdas/lambda_error_handler",
             },
         ]
 
+    def _create_lambda_functions(self) -> List[lambda_.Function]:
+        """Create Lambda functions."""
         lambda_functions = []
-        for cfg in lambda_configs:
-            kwargs = (
-                {
-                    "description": cfg["desc"],
-                }
-                if cfg["desc"]
-                else {}
-            )
-            fn = lambda_.Function(
+
+        for config in self._get_lambda_configs():
+            function = lambda_.Function(
                 self,
-                cfg["id"],
-                function_name=cfg["name"],
+                config["id"],
+                function_name=config["name"],
                 runtime=lambda_.Runtime.PYTHON_3_13,
-                code=lambda_.Code.from_asset(cfg["asset"]),
+                code=lambda_.Code.from_asset(config["asset"]),
                 handler="index.lambda_handler",
-                role=role,
-                layers=[layer],
-                vpc=vpc,
-                security_groups=[lambda_sg],
+                role=self.iam_role,
+                layers=[self.lambda_layer],
+                vpc=self.vpc,
+                security_groups=[self.security_groups["lambda"]],
                 log_retention=logs.RetentionDays.TWO_YEARS,
-                timeout=Duration.minutes(10),
-                vpc_subnets=ec2.SubnetSelection(  # must keep in subnet with nat gateway egress
+                timeout=Duration.minutes(self.LAMBDA_TIMEOUT_MINUTES),
+                vpc_subnets=ec2.SubnetSelection(
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
                 ),
                 environment={
-                    "DB_SECRET_ARN": db_instance.secret.secret_arn,
-                    "DB_NAME": "postgres_db_stepfuncproject",
+                    "DB_SECRET_ARN": self.database.secret.secret_arn,
+                    "DB_NAME": self.DB_NAME,
                 },
-                **kwargs,
+                description=config["description"],
             )
-            lambda_functions.append(fn)
+            lambda_functions.append(function)
 
+        # Grant database access to Lambda functions (excluding error handler)
+        for function in lambda_functions[:3]:  # First 3 functions need DB access
+            self.database.secret.grant_read(function)
+
+        return lambda_functions
+
+    def _create_retry_config(self) -> Dict[str, Any]:
+        """Create common retry configuration for Step Functions tasks."""
+        return {
+            "interval": Duration.seconds(1),
+            "max_attempts": 3,
+            "backoff_rate": 2.0,
+            "errors": [
+                "Lambda.ServiceException",
+                "Lambda.AWSLambdaException",
+                "Lambda.SdkClientException",
+                "Lambda.TooManyRequestsException",
+            ],
+            "jitter_strategy": sfn.JitterType.FULL,
+        }
+
+    def _create_lambda_invoke_task(
+        self, name: str, function: lambda_.Function
+    ) -> tasks.LambdaInvoke:
+        """Create a Lambda invoke task with retry configuration."""
+        return tasks.LambdaInvoke(
+            self,
+            f"Lambda_Invoke_{name}_{self.PROJECT_NAME}",
+            lambda_function=function,
+            payload=sfn.TaskInput.from_json_path_at("$"),
+            output_path="$.Payload",
+        ).add_retry(**self._create_retry_config())
+
+    def _create_state_machine(self) -> sfn.StateMachine:
+        """Create Step Functions state machine."""
         (
             lambda_function_1,
             lambda_function_2,
             lambda_function_3,
             lambda_error_handler,
-        ) = lambda_functions
+        ) = self.lambda_functions
 
-        # Allow Lambdas to connect to the database
-        for fn in [lambda_function_1, lambda_function_2, lambda_function_3]:
-            # db_instance.grant_connect(fn) # iam auth
-            # This allows the Lambda functions to read the database credentials
-            db_instance.secret.grant_read(fn)
+        # Create Lambda invoke tasks
+        invoke_1 = self._create_lambda_invoke_task("1", lambda_function_1)
+        invoke_2 = self._create_lambda_invoke_task("2", lambda_function_2)
+        invoke_3 = self._create_lambda_invoke_task("3", lambda_function_3)
 
-        #################################################
-        # Step Functions State Machine
-        #################################################
-
-        # 1️⃣ Lambda-invoke tasks ---------------------------------------------------
-        invoke_1 = tasks.LambdaInvoke(
-            self,
-            "Lambda_Invoke_1_stepfuncproject",
-            lambda_function=lambda_function_1,
-            payload=sfn.TaskInput.from_json_path_at("$"),
-            output_path="$.Payload",
-        ).add_retry(
-            interval=Duration.seconds(1),
-            max_attempts=3,
-            backoff_rate=2.0,
-            errors=[
-                "Lambda.ServiceException",
-                "Lambda.AWSLambdaException",
-                "Lambda.SdkClientException",
-                "Lambda.TooManyRequestsException",
-            ],
-            jitter_strategy=sfn.JitterType.FULL,
-        )
-
-        invoke_2 = tasks.LambdaInvoke(
-            self,
-            "Lambda_Invoke_2_stepfuncproject",
-            lambda_function=lambda_function_2,
-            payload=sfn.TaskInput.from_json_path_at("$"),
-            output_path="$.Payload",
-        ).add_retry(
-            interval=Duration.seconds(1),
-            max_attempts=3,
-            backoff_rate=2.0,
-            errors=[
-                "Lambda.ServiceException",
-                "Lambda.AWSLambdaException",
-                "Lambda.SdkClientException",
-                "Lambda.TooManyRequestsException",
-            ],
-            jitter_strategy=sfn.JitterType.FULL,
-        )
-
-        invoke_3 = tasks.LambdaInvoke(
-            self,
-            "Lambda_Invoke_3_stepfuncproject",
-            lambda_function=lambda_function_3,
-            payload=sfn.TaskInput.from_json_path_at("$"),
-            output_path="$.Payload",
-        ).add_retry(
-            interval=Duration.seconds(1),
-            max_attempts=3,
-            backoff_rate=2.0,
-            errors=[
-                "Lambda.ServiceException",
-                "Lambda.AWSLambdaException",
-                "Lambda.SdkClientException",
-                "Lambda.TooManyRequestsException",
-            ],
-            jitter_strategy=sfn.JitterType.FULL,
-        )
-
-        # 2️⃣  Shared error branch ---------------------------------------------------
+        # Error handling
         fail_state = sfn.Fail(self, "Fail")
 
         error_handler_task = tasks.LambdaInvoke(
             self,
-            "Lambda_error_handler_invoke_stepfuncproject",
+            f"Lambda_error_handler_invoke_{self.PROJECT_NAME}",
             lambda_function=lambda_error_handler,
-            #  ⬇️  Pass extra context so the Slack msg can say what blew up
             payload=sfn.TaskInput.from_object(
                 {
                     "failedStep.$": "$$.State.Name",
@@ -310,143 +302,105 @@ class StepFuncProjectStack(Stack):
                 }
             ),
             output_path="$.Payload",
-        ).add_retry(
-            interval=Duration.seconds(1),
-            max_attempts=3,
-            backoff_rate=2.0,
-            errors=[
-                "Lambda.ServiceException",
-                "Lambda.AWSLambdaException",
-                "Lambda.SdkClientException",
-                "Lambda.TooManyRequestsException",
-            ],
-            jitter_strategy=sfn.JitterType.FULL,
-        )
+        ).add_retry(**self._create_retry_config())
 
-        # Chain makes it easier to reference from the Choice states
-        error_branch: sfn.IChainable = sfn.Chain.start(error_handler_task).next(
-            fail_state
-        )
+        error_branch = sfn.Chain.start(error_handler_task).next(fail_state)
 
-        # 3️⃣ Choice states ----------------------------------------------------------
+        # Create choice states
         choice_3 = (
-            sfn.Choice(self, "Choice_3_stepfuncproject")
+            sfn.Choice(self, f"Choice_3_{self.PROJECT_NAME}")
             .when(sfn.Condition.boolean_equals("$.success", False), error_branch)
             .otherwise(sfn.Succeed(self, "Success"))
         )
 
         choice_2 = (
-            sfn.Choice(self, "Choice_2_stepfuncproject")
+            sfn.Choice(self, f"Choice_2_{self.PROJECT_NAME}")
             .when(sfn.Condition.boolean_equals("$.success", False), error_branch)
             .otherwise(invoke_3.next(choice_3))
         )
 
         choice_1 = (
-            sfn.Choice(self, "Choice_1_stepfuncproject")
+            sfn.Choice(self, f"Choice_1_{self.PROJECT_NAME}")
             .when(sfn.Condition.boolean_equals("$.success", False), error_branch)
             .otherwise(invoke_2.next(choice_2))
         )
 
-        # 4️⃣ Glue everything together ----------------------------------------------
+        # Create state machine
         definition = invoke_1.next(choice_1)
 
         state_machine = sfn.StateMachine(
             self,
-            "StateMachine_stepfuncproject",
-            state_machine_name="StateMachine_stepfuncproject",
+            f"StateMachine_{self.PROJECT_NAME}",
+            state_machine_name=f"StateMachine_{self.PROJECT_NAME}",
             definition_body=sfn.DefinitionBody.from_chainable(definition),
-            timeout=Duration.minutes(45),
+            timeout=Duration.minutes(self.STATE_MACHINE_TIMEOUT_MINUTES),
         )
 
-        # Allow Step Functions to call Lambdas
-        for fn in [
-            lambda_function_1,
-            lambda_function_2,
-            lambda_function_3,
-            lambda_error_handler,
-        ]:
-            fn.grant_invoke(state_machine.role)
+        # Grant invoke permissions to Lambda functions
+        for function in self.lambda_functions:
+            function.grant_invoke(state_machine.role)
 
-        #############################################################################
-        #  API Gateway  →  HTTP API (v2)  →  Step Functions StartExecution
-        #############################################################################
+        return state_machine
 
-        # 1️⃣ Create an HTTP API
+    def _create_api_gateway(self) -> apigwv2.HttpApi:
+        """Create API Gateway HTTP API."""
+        # Create HTTP API
         http_api = apigwv2.HttpApi(
             self,
-            "HttpApi_stepfuncproject",
-            api_name="HttpApi_stepfuncproject",
+            f"HttpApi_{self.PROJECT_NAME}",
+            api_name=f"HttpApi_{self.PROJECT_NAME}",
         )
 
-        # 2️⃣ Give API Gateway permission to call StartExecution on your state machine
+        # Create API Gateway role
         api_gw_role = iam.Role(
             self,
-            "HttpApi_Role_stepfuncproject",
+            f"HttpApi_Role_{self.PROJECT_NAME}",
             assumed_by=iam.ServicePrincipal("apigateway.amazonaws.com"),
-            role_name="HTTPApi_Role_stepfuncproject",
+            role_name=f"HTTPApi_Role_{self.PROJECT_NAME}",
         )
-        state_machine.grant_start_execution(api_gw_role)
 
-        # 3️⃣ Define the Step Functions integration
+        self.state_machine.grant_start_execution(api_gw_role)
+
+        # Create Step Functions integration
         start_exec_integration = integ.HttpStepFunctionsIntegration(
-            "Start_SF_Integration_stepfuncproject",
-            state_machine=state_machine,
+            f"Start_SF_Integration_{self.PROJECT_NAME}",
+            state_machine=self.state_machine,
             parameter_mapping=apigwv2.ParameterMapping()
-            # The 'StartExecution' API requires the 'Input' parameter (capital "I").
             .custom("Input", "$request.body")
-            # The 'StartExecution' API also requires the 'StateMachineArn'.
-            .custom("StateMachineArn", state_machine.state_machine_arn),
+            .custom("StateMachineArn", self.state_machine.state_machine_arn),
         )
 
-        # 4️⃣ Wire up POST /invoke
+        # Add route
         http_api.add_routes(
             path="/invoke",
             methods=[apigwv2.HttpMethod.POST],
             integration=start_exec_integration,
         )
 
-        # Output the HTTP API endpoint URL
+        return http_api
+
+    def _create_outputs(self) -> None:
+        """Create CloudFormation outputs."""
+        CfnOutput(
+            self,
+            f"HttpApiEndpoint_{self.PROJECT_NAME}",
+            value=self.api_gateway.api_endpoint,
+            description="HTTP API endpoint for Step Functions project",
+            export_name=f"HttpApiEndpoint-{self.PROJECT_NAME}",
+        )
 
         CfnOutput(
             self,
-            "HttpApiEndpoint_stepfuncproject",
-            value=http_api.api_endpoint,
-            description="HTTP API endpoint for Step Functions project",
-            export_name="HttpApiEndpoint-stepfuncproject",
+            f"DatabaseEndpoint_{self.PROJECT_NAME}",
+            value=self.database.db_instance_endpoint_address,
+            description="RDS PostgreSQL endpoint",
+            export_name=f"DatabaseEndpoint-{self.PROJECT_NAME}",
         )
 
-        """
-        This explains the data flow from the client API call to the first Lambda.
-
-        A client does:
-
-        curl -X POST 'https://{api-id}.execute-api.eu-west-2.amazonaws.com/invoke' \
-            -H 'Content-Type: application/json' \
-            -d '{"task":"sync", "data":"some-value"}'
-
-        HTTP API calls the AWS 'StartExecution' API with a payload like this:
-        (Note how the 'Input' field is a stringified version of the client's JSON)
-
-        {
-            "Input": "{\"task\":\"sync\", \"data\":\"some-value\"}",
-            "StateMachineArn": "arn:aws:states:..."
-        }
-
-        Step Functions then parses the "Input" string. Because the first Lambda task
-        is configured to receive the entire state (`$`), the Lambda's 'event' will be
-        the original JSON object sent by the client:
-
-        {
-            "task": "sync",
-            "data": "some-value"
-        }
-        """
-
-        """
-        to do
-        What You Need Instead: Slack Request Verification
-
-        While you don't need CORS, you absolutely must implement a different security mechanism to ensure that the requests hitting your API are genuinely from Slack and not from a malicious actor.
-
-        also change names of resources
-        """
+        CfnOutput(
+            self,
+            f"StateMachineArn_{self.PROJECT_NAME}",
+            value=self.state_machine.state_machine_arn,
+            description="Step Functions State Machine ARN",
+            export_name=f"StateMachineArn-{self.PROJECT_NAME}",
+        )
