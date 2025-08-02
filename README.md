@@ -1,58 +1,103 @@
+# Step Functions Project (AWS CDK, Python)
 
-# Welcome to your CDK Python project!
+A production-ready AWS CDK stack that provisions a serverless workflow to fetch, process, and validate PagerDuty incident data using AWS Step Functions orchestrating Lambda functions, with persistence in an RDS PostgreSQL database. The workflow is triggered via an API Gateway HTTP API endpoint and includes robust error handling.
 
-This is a blank project for CDK development with Python.
+## Architecture Overview
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+- API Gateway HTTP API exposes a POST endpoint to start executions.
+- AWS Step Functions runs a three-step workflow:
+  1. Fetch initial data and create base DB schema.
+  2. Fetch complete incident data and populate DB.
+  3. Validate data in the DB.
+- A dedicated error-handler Lambda captures failures and marks the execution as failed.
+- RDS PostgreSQL runs inside an existing VPC and private subnets.
+- Lambdas run in private subnets with a security group allowing DB access.
+- Secrets Manager stores DB credentials; Lambdas read the secret at runtime.
 
-This project is set up like a standard Python project.  The initialization
-process also creates a virtualenv within this project, stored under the `.venv`
-directory.  To create the virtualenv it assumes that there is a `python3`
-(or `python` for Windows) executable in your path with access to the `venv`
-package. If for any reason the automatic creation of the virtualenv fails,
-you can create the virtualenv manually.
 
-To manually create a virtualenv on MacOS and Linux:
+## Prerequisites
 
-```
-$ python3 -m venv .venv
-```
+- AWS account with permission to deploy CDK stacks (CloudFormation, IAM, RDS, Lambda, API Gateway, Step Functions, Secrets Manager, CloudWatch).
+- Node.js (for CDK CLI) and Python 3.13 (project uses Python 3.13 runtime).
+- AWS CDK v2 installed:
+  - npm install -g aws-cdk
+- Python tooling:
+  - pip install -r requirements.txt (ensure aws-cdk-lib and constructs)
 
-After the init process completes and the virtualenv is created, you can use the following
-step to activate your virtualenv.
+Ensure the specified VPC and subnet IDs exist and are correct:
+- VPC: `vpc-0e01c3c7ae69fd92b`
+- Private subnets:
+  - `subnet-0e2842b86fa358d19` (eu-west-2c)
+  - `subnet-0ff5a9d643e0b97c8` (eu-west-2b)
+- Route table IDs as configured in the code.
 
-```
-$ source .venv/bin/activate
-```
+Lambdas need internet access (e.g., to reach PagerDuty APIs), ensure these private subnets have a NAT gateway route for egress.
 
-If you are a Windows platform, you would activate the virtualenv like this:
+## Project Structure
 
-```
-% .venv\Scripts\activate.bat
-```
+- cdk stack: StepFuncProjectStack
+- lambdas/
+  - lambda_1/ (initial fetch + base schema)
+  - lambda_2/ (complete data fetch + populate)
+  - lambda_3/ (validate)
+  - lambda_error_handler/ (handle workflow failures)
+- layer/ (shared Python layer dependencies)
 
-Once the virtualenv is activated, you can install the required dependencies.
+## Key Configuration
 
-```
-$ pip install -r requirements.txt
-```
+- Project name: `stepfuncproject`
+- Database:
+  - Engine: PostgreSQL 17.5
+  - Instance type: t4g.micro
+  - Storage: 20 GB (max 30 GB)
+  - Private, non-publicly accessible
+  - Credentials: Generated and stored in Secrets Manager
+  - IAM authentication: Enabled
+- Lambda:
+  - Runtime: Python 3.13
+  - Timeout: 10 minutes
+  - VPC-attached, private with egress
+  - Env vars:
+    - DB_SECRET_ARN: ARN of Secrets Manager secret
+    - DB_NAME: `postgres_db_stepfuncproject`
+- Step Functions:
+  - Timeout: 45 minutes
+  - Retry config on LambdaInvoke: 3 attempts, 1s base, backoff 2.0, full jitter
+  - Control flow depends on each Lambda returning a JSON with `success: true|false`
+- API Gateway HTTP API:
+  - Route: POST `/invoke`
+  - Integration: Starts Step Functions execution
+  - Input mapping: Request body becomes state input
 
-At this point you can now synthesize the CloudFormation template for this code.
+## Security Notes
 
-```
-$ cdk synth
-```
+- Current IAM role for Lambda uses broad managed policies (AmazonRDSFullAccess, SecretsManagerReadWrite, CloudWatchFullAccessV2). For production, replace with scoped, least-privilege inline policies.
+- RDS storage encryption is commented out; enable if required by your compliance.
+- API route is unauthenticated by default; add an authorizer (JWT, IAM, or Lambda) before exposing publicly.
 
-To add additional dependencies, for example other CDK libraries, just add
-them to your `setup.py` file and rerun the `pip install -r requirements.txt`
-command.
 
-## Useful commands
+## Invocation
 
- * `cdk ls`          list all stacks in the app
- * `cdk synth`       emits the synthesized CloudFormation template
- * `cdk deploy`      deploy this stack to your default AWS account/region
- * `cdk diff`        compare deployed stack with current state
- * `cdk docs`        open CDK documentation
+After deployment, note the CloudFormation outputs:
+- HttpApiEndpoint-stepfuncproject
+- DatabaseEndpoint-stepfuncproject
+- StateMachineArn-stepfuncproject
 
-Enjoy!
+Trigger the workflow:
+- curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"some":"input"}' \
+  https://{api-id}.execute-api.{region}.amazonaws.com/invoke
+
+The JSON payload is passed to Lambda 1 as input. Each Lambda should return an object with at least:
+- { "success": true, ... }
+
+If any Lambda returns `success: false` (or omits it), the error-handler Lambda is invoked, and the state machine fails.
+
+
+## Troubleshooting
+
+- Lambdas cannot reach the internet: Ensure private subnets have NAT and correct route tables.
+- Cannot connect to DB: Verify security group rule (lambda_sg -> rds_sg on 5432), subnet routing, and that Lambdas use the correct VPC/subnets.
+- Secrets access denied: Ensure the specific Lambda has read permissions to the Secrets Manager secret.
+- State machine not starting: Confirm API Gateway role has StartExecution permission and integration mapping is correct.
