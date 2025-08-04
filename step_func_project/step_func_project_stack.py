@@ -1,3 +1,5 @@
+import yaml
+from pathlib import Path
 from aws_cdk import (
     Duration,
     Stack,
@@ -5,7 +7,6 @@ from aws_cdk import (
     aws_iam as iam,
     aws_rds as rds,
     aws_ec2 as ec2,
-    aws_apigateway as apigateway,
     aws_lambda as lambda_,
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
@@ -24,33 +25,40 @@ class StepFuncProjectStack(Stack):
     RDS PostgreSQL database, and API Gateway integration.
     """
 
-    # Class constants
-    PROJECT_NAME = "stepfuncproject"
-    DB_NAME = f"postgres_db_{PROJECT_NAME}"
-    SECRET_NAME = f"rds_postgres_creds_{PROJECT_NAME}"
-    POSTGRES_PORT = 5432
-    LAMBDA_TIMEOUT_MINUTES = 10
-    STATE_MACHINE_TIMEOUT_MINUTES = 45
-    VPC_ID = "vpc-0e01c3c7ae69fd92b"
-
-    # Subnet configuration
-    SUBNET_CONFIG = {
-        "private_subnet_1": {
-            "subnet_id": "subnet-0e2842b86fa358d19",
-            "availability_zone": "eu-west-2c",
-            "route_table_id": "rtb-091951509bec3c07f",
-        },
-        "private_subnet_2": {
-            "subnet_id": "subnet-0ff5a9d643e0b97c8",
-            "availability_zone": "eu-west-2b",
-            "route_table_id": "rtb-091951509bec3c07f",
-        },
-    }
-
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # Create infrastructure components
+        # Load configuration from variables.yml
+        self.config = self._load_config()
+
+        #######################################################
+        ############### VARIABLES FROM CONFIG  ################
+        #######################################################
+
+        self.PROJECT_NAME = self.config["project"]["name"]
+        self.DB_NAME = f"{self.config['database']['name_suffix']}_{self.PROJECT_NAME}"
+        self.SECRET_NAME = (
+            f"{self.config['database']['secret_name_suffix']}_{self.PROJECT_NAME}"
+        )
+        self.POSTGRES_PORT = self.config["database"]["port"]
+        self.LAMBDA_TIMEOUT_MINUTES = self.config["lambda"]["timeout_minutes"]
+        self.STATE_MACHINE_TIMEOUT_MINUTES = self.config["step_functions"][
+            "timeout_minutes"
+        ]
+        self.VPC_ID = self.config["vpc"]["id"]
+
+        # Subnet configuration from config
+        self.SUBNET_CONFIG = {}
+        for subnet_name, subnet_config in self.config["subnets"].items():
+            self.SUBNET_CONFIG[subnet_name] = {
+                "subnet_id": subnet_config["subnet_id"],
+                "availability_zone": subnet_config["availability_zone"],
+                "route_table_id": subnet_config["route_table_id"],
+            }
+
+        ###########################################################
+        ############### INFRASTRUCTURE COMPONENTS  ################
+        ###########################################################
         self.vpc = self._create_vpc()
         self.subnets = self._create_subnets()
         self.security_groups = self._create_security_groups()
@@ -62,6 +70,21 @@ class StepFuncProjectStack(Stack):
         self.api_gateway = self._create_api_gateway()
 
         self._create_outputs()
+
+    def _load_config(self) -> Dict[str, Any]:
+        """Load configuration from variables.yml file."""
+        # Go up one directory level to reach the root where variables.yml is located
+        current_dir = Path(__file__).parent.parent  # Note the extra .parent
+        config_path = current_dir / "variables.yml"
+
+        try:
+            with open(config_path, "r") as file:
+                config = yaml.safe_load(file)
+                return config
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Configuration file not found at: {config_path}")
+        except yaml.YAMLError as e:
+            raise ValueError(f"Error parsing YAML configuration: {e}")
 
     def _create_vpc(self) -> ec2.IVpc:
         """Create or import existing VPC."""
