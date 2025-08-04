@@ -1,0 +1,43 @@
+# Project Configuration
+project:
+  name: "stepfuncproject"
+  
+# AWS Environment Configuration
+aws:
+  account_id: "985936675960"
+  region: "us-west-2"
+
+# Tags Configuration
+tags:
+  created_by: "cdk"
+  project: "step-function-project"  
+  app_manager_cfn_stack_key: "step-function-project"  # for aws cost explorer
+  
+# Database Configuration
+database:
+  name_suffix: "postgres_db"
+  secret_name_suffix: "rds_postgres_creds"
+  port: 5432
+
+# Lambda Configuration
+lambda:
+  timeout_minutes: 10
+
+# Step Functions Configuration
+step_functions:
+  timeout_minutes: 45
+
+# VPC Configuration
+vpc:
+  id: "vpc-092585a1990a68825"
+
+# Subnet Configuration
+subnets:
+  private_subnet_1:
+    subnet_id: "subnet-03c457f404020556b"
+    availability_zone: "us-west-2a"
+    route_table_id: "rtb-0325bab652d32045c"
+  private_subnet_2:
+    subnet_id: "subnet-02f5bb3c29cd14891"
+    availability_zone: "us-west-2b"
+    route_table_id: "rtb-0fa7214d56f535468"
