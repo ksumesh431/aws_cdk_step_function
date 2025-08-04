@@ -20,9 +20,7 @@ app = cdk.App()
 
 # Global tags
 for tag_key, tag_value in config["tags"].items():
-    Tags.of(app).add(
-        tag_key.replace("_", "-") if "_" in tag_key else tag_key, tag_value
-    )  # Add tags from config
+    Tags.of(app).add(tag_key, tag_value)
 
 StepFuncProjectStack(
     app,

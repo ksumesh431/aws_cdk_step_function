@@ -10,9 +10,9 @@ aws:
 # Tags Configuration
 tags:
   created_by: "cdk"
-  project: "step-function-project"  
-  app_manager_cfn_stack_key: "step-function-project"  # for aws cost explorer
-  
+  project: "step-function-project"
+  AppManagerCFNStackKey: "step-function-project" # for application manager cost tracking
+
 # Database Configuration
 database:
   name_suffix: "postgres_db"

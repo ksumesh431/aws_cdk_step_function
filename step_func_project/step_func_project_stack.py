@@ -34,17 +34,12 @@ class StepFuncProjectStack(Stack):
         #######################################################
         ############### VARIABLES FROM CONFIG  ################
         #######################################################
-
         self.PROJECT_NAME = self.config["project"]["name"]
         self.DB_NAME = f"{self.config['database']['name_suffix']}_{self.PROJECT_NAME}"
-        self.SECRET_NAME = (
-            f"{self.config['database']['secret_name_suffix']}_{self.PROJECT_NAME}"
-        )
+        self.SECRET_NAME = (f"{self.config['database']['secret_name_suffix']}_{self.PROJECT_NAME}")
         self.POSTGRES_PORT = self.config["database"]["port"]
         self.LAMBDA_TIMEOUT_MINUTES = self.config["lambda"]["timeout_minutes"]
-        self.STATE_MACHINE_TIMEOUT_MINUTES = self.config["step_functions"][
-            "timeout_minutes"
-        ]
+        self.STATE_MACHINE_TIMEOUT_MINUTES = self.config["step_functions"]["timeout_minutes"]
         self.VPC_ID = self.config["vpc"]["id"]
 
         # Subnet configuration from config
@@ -140,7 +135,7 @@ class StepFuncProjectStack(Stack):
 
     def _create_database(self) -> rds.DatabaseInstance:
         """Create RDS PostgreSQL instance."""
-        return rds.DatabaseInstance(
+        database = rds.DatabaseInstance(
             self,
             f"rds_postgres_{self.PROJECT_NAME}",
             database_name=self.DB_NAME,
@@ -162,8 +157,15 @@ class StepFuncProjectStack(Stack):
             ),
             deletion_protection=False,
             iam_authentication=True,
-            # storage_encrypted=True,  # Enable encryption for security
+            storage_encrypted=True,  # Enable encryption for security
         )
+
+        # Enable automatic rotation for the database secret
+        database.add_rotation_single_user(
+            automatically_after=Duration.days(30),  # Rotate every 30 days
+        )
+
+        return database
 
     def _create_iam_role(self) -> iam.Role:
         """Create IAM role for Lambda functions."""
@@ -248,7 +250,6 @@ class StepFuncProjectStack(Stack):
                 layers=[self.lambda_layer],
                 vpc=self.vpc,
                 security_groups=[self.security_groups["lambda"]],
-                log_retention=logs.RetentionDays.TWO_YEARS,
                 timeout=Duration.minutes(self.LAMBDA_TIMEOUT_MINUTES),
                 vpc_subnets=ec2.SubnetSelection(
                     subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
@@ -351,12 +352,26 @@ class StepFuncProjectStack(Stack):
         # Create state machine
         definition = invoke_1.next(choice_1)
 
+        # Create CloudWatch Log Group for Step Functions
+        log_group = logs.LogGroup(
+            self,
+            f"StateMachine_LogGroup_{self.PROJECT_NAME}",
+            log_group_name=f"/aws/stepfunctions/StateMachine_{self.PROJECT_NAME}",
+            removal_policy=RemovalPolicy.DESTROY,
+            retention=logs.RetentionDays.TWO_YEARS,  # Adjust retention as needed
+        )
+
         state_machine = sfn.StateMachine(
             self,
             f"StateMachine_{self.PROJECT_NAME}",
             state_machine_name=f"StateMachine_{self.PROJECT_NAME}",
             definition_body=sfn.DefinitionBody.from_chainable(definition),
             timeout=Duration.minutes(self.STATE_MACHINE_TIMEOUT_MINUTES),
+            logs=sfn.LogOptions(
+                destination=log_group,
+                level=sfn.LogLevel.ALL,  # Log all events
+                include_execution_data=True,  # Include input/output data in logs
+            ),
         )
 
         # Grant invoke permissions to Lambda functions
