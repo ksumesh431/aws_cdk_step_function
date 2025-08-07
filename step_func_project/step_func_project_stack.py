@@ -330,6 +330,16 @@ class StepFuncProjectStack(Stack):
 
         error_branch = sfn.Chain.start(error_handler_task).next(fail_state)
 
+
+        # Comment this to get old flow which wont catch lambda timeout or any other lambda errors
+        # catch ANY Lambda failure (after retries) and route to the error branch
+        for inv in (invoke_1, invoke_2, invoke_3):
+            inv.add_catch(
+                error_branch,
+                result_path="$.error",        # put the error object at $.error
+                errors=["States.ALL"],        # catch everything
+            )
+
         # Create choice states
         choice_3 = (
             sfn.Choice(self, f"Choice_3_{self.PROJECT_NAME}")

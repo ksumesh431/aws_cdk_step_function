@@ -160,13 +160,13 @@ def lambda_handler(event, context):
         print("=== PagerDuty Incident Ingestion Lambda Started ===")
 
         # 1. Fetch PagerDuty API Key from AWS Secrets Manager
-        pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty")
+        pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty/API_KEY")
         pagerduty_secret = json.loads(pagerduty_secret_payload["SecretString"])
-        pagerduty_api_key = pagerduty_secret.get("PAGERDUTY_API_KEY")
+        pagerduty_api_key = pagerduty_secret.get("API_KEY")
 
         if not pagerduty_api_key:
             raise KeyError(
-                "Secret from Secrets Manager does not contain the key 'PAGERDUTY_API_KEY'"
+                "Secret from Secrets Manager does not contain the key 'API_KEY'"
             )
 
         # 2. Get Database Credentials from AWS Secrets Manager

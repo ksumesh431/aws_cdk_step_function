@@ -309,15 +309,15 @@ def process_single_incident(incident_id, api_key):
 secrets_client = boto3.client("secretsmanager")
 
 
-# === REFACTORED Main Lambda Handler ===
+# === Main Lambda Handler ===
 def lambda_handler(event, context):
     try:
         print("=== PagerDuty Incident ENRICHMENT Lambda Started (Concurrent Mode) ===")
 
         # --- 1. Setup: Get secrets and DB engine (same as before) ---
-        pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty")
+        pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty/API_KEY")
         pagerduty_api_key = json.loads(pagerduty_secret_payload["SecretString"])[
-            "PAGERDUTY_API_KEY"
+            "API_KEY"
         ]
 
         db_secret_arn = os.environ["DB_SECRET_ARN"]
