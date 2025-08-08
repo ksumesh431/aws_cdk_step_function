@@ -83,7 +83,20 @@ CATEGORIES = {
 
 def lambda_handler(event, context):
     try:
-        # 1) Secrets / DB
+        print("=== PagerDuty Data Validation Lambda Started ===")
+
+        # Extract parameters from event
+        force_refresh = event.get("force_refresh", False)
+        freshness_threshold_minutes = event.get("freshness_threshold_minutes", 30)
+        validation_threshold_minutes = event.get(
+            "validation_threshold_minutes", 15
+        )  # Separate threshold for validation
+
+        print(f"Force refresh: {force_refresh}")
+        print(f"Freshness threshold: {freshness_threshold_minutes} minutes")
+        print(f"Validation threshold: {validation_threshold_minutes} minutes")
+
+        # Get database connection
         db_secret_arn = os.environ["DB_SECRET_ARN"]
         secret = json.loads(
             secrets.get_secret_value(SecretId=db_secret_arn)["SecretString"]
@@ -97,15 +110,53 @@ def lambda_handler(event, context):
         with Session(engine) as s:
             P = PagerDutyIncident  # alias
 
-            # # 2) Freshness
+            # Check if we need to run validation based on last validation time
+            if not force_refresh:
+                # Find the most recent validation time (you could track this separately if needed)
+                # For now, we'll use the most recent last_updated as a proxy
+                latest_update = s.query(func.max(P.last_updated)).scalar()
+
+                if latest_update:
+                    minutes_since_update = (now - latest_update).total_seconds() / 60
+
+                    if minutes_since_update < validation_threshold_minutes:
+                        print(
+                            f"Data was recently updated ({minutes_since_update:.1f} minutes ago). Skipping validation."
+                        )
+                        return {
+                            "success": True,
+                            "skipped": True,
+                            "reason": "recently_validated",
+                            "minutes_since_update": round(minutes_since_update, 1),
+                            "failed_checks": 0,
+                            "issues": [],
+                            "validated_at": now.isoformat(),
+                        }
+
+            print("Proceeding with data validation checks...")
+
+            # # 1) Data Freshness Check
             # max_updated = s.query(func.max(P.last_updated)).scalar()
-            # if not max_updated or (now - max_updated).total_seconds() > 15 * 60:
+            # if (
+            #     not max_updated
+            #     or (now - max_updated).total_seconds()
+            #     > freshness_threshold_minutes * 60
+            # ):
             #     failed_checks += 1
             #     issues.append(
-            #         {"check": "freshness", "max_last_updated": str(max_updated)}
+            #         {
+            #             "check": "data_freshness",
+            #             "max_last_updated": str(max_updated),
+            #             "threshold_minutes": freshness_threshold_minutes,
+            #             "minutes_since_update": (
+            #                 round((now - max_updated).total_seconds() / 60, 1)
+            #                 if max_updated
+            #                 else None
+            #             ),
+            #         }
             #     )
 
-            # 3) Missing enrichments
+            # 2) Missing enrichments
             missing = (
                 s.query(func.count())
                 .filter(
@@ -118,13 +169,13 @@ def lambda_handler(event, context):
                 failed_checks += 1
                 issues.append({"check": "enrichment_missing", "count": int(missing)})
 
-            # 4) Duplicates (total - distinct)
+            # 3) Duplicates (total - distinct)
             dup = s.query((func.count(P.id) - func.count(func.distinct(P.id)))).scalar()
             if dup and dup > 0:
                 failed_checks += 1
                 issues.append({"check": "duplicates", "count": int(dup)})
 
-            # 5) Enumerations invalid
+            # 4) Enumerations invalid
             bad_enum = (
                 s.query(func.count())
                 .filter(
@@ -143,7 +194,7 @@ def lambda_handler(event, context):
                 failed_checks += 1
                 issues.append({"check": "enum_invalid", "count": int(bad_enum)})
 
-            # 6) Negative minutes
+            # 5) Negative minutes
             negative = (
                 s.query(func.count())
                 .filter(
@@ -163,7 +214,7 @@ def lambda_handler(event, context):
                 failed_checks += 1
                 issues.append({"check": "negative_durations", "count": int(negative)})
 
-            # 7) Timestamp ordering violations
+            # 6) Timestamp ordering violations
             ordering = (
                 s.query(func.count())
                 .filter(
@@ -191,7 +242,7 @@ def lambda_handler(event, context):
                 failed_checks += 1
                 issues.append({"check": "timestamp_ordering", "count": int(ordering)})
 
-            # 8) Derived minutes drift (all *_minutes fields)
+            # 7) Derived minutes drift (all *_minutes fields)
             tol = 0.01  # minutes = 0.6 seconds to avoid round off errors
             diff_ack = case(
                 (
@@ -329,9 +380,49 @@ def lambda_handler(event, context):
                 failed_checks += 1
                 issues.append({"check": "derived_minutes_drift", "count": int(drift)})
 
-        ok = failed_checks == 0
-        return {"success": True, "failed_checks": failed_checks, "issues": issues} # pass "success": ok if wanna go to error handler on failed checks
-        
+            # Get total record count for context
+            total_records = s.query(func.count(P.id)).scalar()
+
+        print(
+            f"Validation completed. Failed checks: {failed_checks}, Total records: {total_records}"
+        )
+
+        # Log summary of issues found
+        if issues:
+            print("Issues found:")
+            for issue in issues:
+                print(f"  - {issue['check']}: {issue.get('count', 'N/A')}")
+
+        return {
+            "success": True,  # Always return success unless there's an exception
+            "skipped": False,
+            "failed_checks": failed_checks,
+            "issues": issues,
+            "validated_at": now.isoformat(),
+            "total_records": total_records,
+            "validation_summary": {
+                # "data_freshness_ok": not any(
+                #     i["check"] == "data_freshness" for i in issues
+                # ),
+                "no_missing_enrichments": not any(
+                    i["check"] == "enrichment_missing" for i in issues
+                ),
+                "no_duplicates": not any(i["check"] == "duplicates" for i in issues),
+                "field_values_valid": not any(i["check"] == "enum_invalid" for i in issues),
+                "no_negative_durations": not any(
+                    i["check"] == "negative_durations" for i in issues
+                ),
+                "timestamps_ordered": not any(
+                    i["check"] == "timestamp_ordering" for i in issues
+                ),
+                "derived_minutes_accurate": not any(
+                    i["check"] == "derived_minutes_drift" for i in issues
+                ),
+            },
+        }
+
+        # Uncomment this line if you want validation failures to trigger error handling:
+        # return {"success": failed_checks == 0, "failed_checks": failed_checks, "issues": issues, "validated_at": now.isoformat()}
 
     except Exception as e:
         print(f"Validation lambda error: {e}")

@@ -5,7 +5,7 @@ import requests
 import concurrent.futures  # Import the concurrency library
 
 import boto3
-from sqlalchemy import create_engine, Index, Column, String, DateTime, Float
+from sqlalchemy import create_engine, Index, Column, String, DateTime, Float, func
 from sqlalchemy.orm import declarative_base, Session
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -314,8 +314,17 @@ def lambda_handler(event, context):
     try:
         print("=== PagerDuty Incident ENRICHMENT Lambda Started (Concurrent Mode) ===")
 
-        # --- 1. Setup: Get secrets and DB engine (same as before) ---
-        pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty/API_KEY")
+        # Extract parameters from event
+        force_refresh = event.get("force_refresh", False)
+        freshness_threshold_minutes = event.get("freshness_threshold_minutes", 30)
+
+        print(f"Force refresh: {force_refresh}")
+        print(f"Freshness threshold: {freshness_threshold_minutes} minutes")
+
+        # Get secrets and setup
+        pagerduty_secret_payload = secrets_client.get_secret_value(
+            SecretId="pagerduty/API_KEY"
+        )
         pagerduty_api_key = json.loads(pagerduty_secret_payload["SecretString"])[
             "API_KEY"
         ]
@@ -327,31 +336,82 @@ def lambda_handler(event, context):
         engine = get_engine(db_secret)
         Base.metadata.create_all(engine)
 
-        # --- 2. Get the list of work to do (same as before) ---
         with Session(engine) as session:
-            incidents_to_enrich = (
-                session.query(PagerDutyIncident)
-                .filter(
-                    PagerDutyIncident.severity != "N/A",
-                    PagerDutyIncident.incident_summary == None,
+            # Check freshness if not forcing refresh
+            if not force_refresh:
+                # Check if we have recent enrichments
+                latest_enrichment = (
+                    session.query(func.max(PagerDutyIncident.last_updated))
+                    .filter(
+                        PagerDutyIncident.incident_summary.isnot(None)
+                    )  # Only enriched records
+                    .scalar()
                 )
-                .all()
-            )
+
+                if latest_enrichment:
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    minutes_since_enrichment = (
+                        now - latest_enrichment
+                    ).total_seconds() / 60
+
+                    if minutes_since_enrichment < freshness_threshold_minutes:
+                        print(
+                            f"Enriched data is fresh (updated {minutes_since_enrichment:.1f} minutes ago). Skipping enrichment."
+                        )
+                        return {
+                            "success": True,
+                            "skipped": True,
+                            "reason": "enriched_data_is_fresh",
+                            "minutes_since_enrichment": round(
+                                minutes_since_enrichment, 1
+                            ),
+                            "incidents_updated": 0,
+                            "force_refresh": force_refresh,
+                            "freshness_threshold_minutes": freshness_threshold_minutes,
+                        }
+
+            # Find incidents to enrich
+            if force_refresh:
+                # If forcing refresh, enrich all incidents (or recent ones)
+                incidents_to_enrich = (
+                    session.query(PagerDutyIncident)
+                    .filter(PagerDutyIncident.severity != "N/A")
+                    .all()
+                )
+                print(
+                    f"Force refresh: Found {len(incidents_to_enrich)} total incidents to re-enrich"
+                )
+            else:
+                # Normal mode: only enrich incidents missing enrichment data
+                incidents_to_enrich = (
+                    session.query(PagerDutyIncident)
+                    .filter(
+                        PagerDutyIncident.severity != "N/A",
+                        PagerDutyIncident.incident_summary == None,
+                    )
+                    .all()
+                )
+                print(
+                    f"Normal mode: Found {len(incidents_to_enrich)} incidents needing enrichment"
+                )
 
         if not incidents_to_enrich:
-            print("No new incidents to enrich found in the database.")
-            return {"success": True, "message": "No new incidents to enrich."}
+            print("No incidents to enrich found in the database.")
+            return {
+                "success": True,
+                "message": "No incidents to enrich.",
+                "incidents_updated": 0,
+                "force_refresh": force_refresh,
+                "freshness_threshold_minutes": freshness_threshold_minutes,
+            }
 
-        # Extract just the IDs to pass to the workers
+        # Extract incident IDs for processing
         incident_ids = [incident.id for incident in incidents_to_enrich]
-        print(
-            f"Found {len(incident_ids)} incidents to enrich. Starting parallel processing."
-        )
+        print(f"Processing {len(incident_ids)} incidents with parallel processing.")
 
-        # --- 3. Process incidents in parallel ---
+        # Process incidents in parallel (existing logic)
         all_enriched_data = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # Create a future for each incident ID. We pass the API key to the worker.
             future_to_id = {
                 executor.submit(
                     process_single_incident, incident_id, pagerduty_api_key
@@ -362,7 +422,6 @@ def lambda_handler(event, context):
             for future in concurrent.futures.as_completed(future_to_id):
                 incident_id = future_to_id[future]
                 try:
-                    # Get the result from the completed future
                     enriched_data = future.result()
                     if enriched_data:
                         all_enriched_data.append(enriched_data)
@@ -376,23 +435,30 @@ def lambda_handler(event, context):
             return {
                 "success": True,
                 "message": "No incidents were successfully enriched.",
+                "incidents_updated": 0,
+                "force_refresh": force_refresh,
+                "freshness_threshold_minutes": freshness_threshold_minutes,
             }
 
-        # --- 4. Update the database in a single transaction ---
+        # Update database
         updated_count = 0
         with Session(engine) as session:
             print(
                 f"Updating {len(all_enriched_data)} enriched incidents in the database..."
             )
             for data in all_enriched_data:
-                # Add the last_updated timestamp just before saving
                 data["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
                 session.merge(PagerDutyIncident(**data))
                 updated_count += 1
-            session.commit()  # Commit all updates at once
+            session.commit()
 
         print(f"SUCCESS: Processed and updated {updated_count} incidents.")
-        return {"success": True, "incidents_updated": updated_count}
+        return {
+            "success": True,
+            "incidents_updated": updated_count,
+            "force_refresh": force_refresh,
+            "freshness_threshold_minutes": freshness_threshold_minutes,
+        }
 
     except Exception as exc:
         error_message = f"An unexpected error occurred in the handler: {exc}"

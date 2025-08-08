@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     Table,
     MetaData,
+    func,
 )
 from sqlalchemy.orm import declarative_base, Session
 
@@ -159,8 +160,20 @@ def lambda_handler(event, context):
     try:
         print("=== PagerDuty Incident Ingestion Lambda Started ===")
 
-        # 1. Fetch PagerDuty API Key from AWS Secrets Manager
-        pagerduty_secret_payload = secrets_client.get_secret_value(SecretId="pagerduty/API_KEY")
+        # Extract parameters from event
+        force_refresh = event.get("force_refresh", False)
+        freshness_threshold_minutes = event.get(
+            "freshness_threshold_minutes", 30
+        )  # Default 30 minutes
+        days = event.get("days", 30)  # Default to last 30 days
+
+        print(f"Force refresh: {force_refresh}")
+        print(f"Freshness threshold: {freshness_threshold_minutes} minutes")
+
+        # Get secrets and database connection
+        pagerduty_secret_payload = secrets_client.get_secret_value(
+            SecretId="pagerduty/API_KEY"
+        )
         pagerduty_secret = json.loads(pagerduty_secret_payload["SecretString"])
         pagerduty_api_key = pagerduty_secret.get("API_KEY")
 
@@ -169,43 +182,61 @@ def lambda_handler(event, context):
                 "Secret from Secrets Manager does not contain the key 'API_KEY'"
             )
 
-        # 2. Get Database Credentials from AWS Secrets Manager
         db_secret_arn = os.environ["DB_SECRET_ARN"]
-        print(
-            f"Fetching Database credentials from Secrets Manager ARN: {db_secret_arn}"
-        )
         db_secret_payload = secrets_client.get_secret_value(SecretId=db_secret_arn)
         db_secret = json.loads(db_secret_payload["SecretString"])
 
-        # 3. Connect to the Database and Create Table if it doesn't exist
         engine = get_engine(db_secret)
         Base.metadata.create_all(engine)
 
-        ###################################################################
-        ################ code to set last_updated as index ################
-        # reflect just that one table
+        # Create index if it doesn't exist
         meta = MetaData()
         tbl = Table("pagerduty_incidents", meta, autoload_with=engine)
-
-        # define your index
         idx = Index("ix_pdi_last_updated", tbl.c.last_updated)
-
-        # create only if it doesn't exist already
         idx.create(bind=engine, checkfirst=True)
-        ################ code to set last_updated as index ################
-        ###################################################################
 
-        # 4. Fetch Incidents from PagerDuty API
-        incidents = fetch_pagerduty_incidents(pagerduty_api_key)
+        # Check if we need to refresh based on last_updated
+        if not force_refresh:
+            with Session(engine) as session:
+                latest_update = session.query(
+                    func.max(PagerDutyIncident.last_updated)
+                ).scalar()
+
+                if latest_update:
+                    now = datetime.datetime.now(datetime.timezone.utc)
+                    minutes_since_update = (now - latest_update).total_seconds() / 60
+
+                    if minutes_since_update < freshness_threshold_minutes:
+                        print(
+                            f"Data is fresh (updated {minutes_since_update:.1f} minutes ago). Skipping refresh."
+                        )
+                        return {
+                            "success": True,
+                            "skipped": True,
+                            "reason": "data_is_fresh",
+                            "force_refresh": force_refresh,
+                            "freshness_threshold_minutes": freshness_threshold_minutes,
+                            "minutes_since_update": round(minutes_since_update, 1),
+                            "incidents_processed": 0,
+                        }
+
+        # Proceed with normal processing
+        incidents = fetch_pagerduty_incidents(pagerduty_api_key, days=days)
         if not incidents:
             print("No new incidents found in PagerDuty.")
-            return {"success": True, "message": "No new incidents found."}
+            return {
+                "success": True,
+                "incidents_processed": 0,
+                "message": "No new incidents found.",
+                "force_refresh": force_refresh,
+                "freshness_threshold_minutes": freshness_threshold_minutes,
+            }
 
         print(
             f"Fetched {len(incidents)} incidents from PagerDuty. Processing for database."
         )
 
-        # 5. Process and Save Incidents to the Database
+        # Process and save incidents
         with Session(engine) as session:
             for incident_data in incidents:
                 incident_to_save = PagerDutyIncident(
@@ -220,12 +251,20 @@ def lambda_handler(event, context):
                         incident_data.get("created_at"),
                         incident_data.get("resolved_at"),
                     ),
+                    last_updated=datetime.datetime.now(
+                        datetime.timezone.utc
+                    ),  # Set last_updated
                 )
                 session.merge(incident_to_save)
             session.commit()
 
         print(f"SUCCESS: Processed and saved/updated {len(incidents)} incidents.")
-        return {"success": True, "incidents_processed": len(incidents)}
+        return {
+            "success": True,
+            "force_refresh": force_refresh,
+            "freshness_threshold_minutes": freshness_threshold_minutes,
+            "incidents_processed": len(incidents),
+        }
 
     except Exception as exc:
         error_message = f"An error occurred: {exc}"
