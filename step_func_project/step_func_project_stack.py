@@ -41,6 +41,11 @@ class StepFuncProjectStack(Stack):
         self.LAMBDA_TIMEOUT_MINUTES = self.config["lambda"]["timeout_minutes"]
         self.STATE_MACHINE_TIMEOUT_MINUTES = self.config["step_functions"]["timeout_minutes"]
         self.VPC_ID = self.config["vpc"]["id"]
+        self.ENABLE_WINDOWS_SERVER = self.config.get("ec2", {}).get("enable_windows_server", False)
+        self.EC2_INSTANCE_TYPE = self.config.get("ec2", {}).get("instance_type", "t3.medium")
+        self.EC2_KEY_NAME = self.config.get("ec2", {}).get("key_name", None)
+        self.EC2_AMI_NAME = self.config.get("ec2", {}).get("ami_name", "Windows_Server-2022-English-Full-Base-*")
+        self.EC2_SUBNET_NAME = self.config.get("ec2", {}).get("subnet_name", None)
 
         # Subnet configuration from config
         self.SUBNET_CONFIG = {}
@@ -63,6 +68,12 @@ class StepFuncProjectStack(Stack):
         self.lambda_functions = self._create_lambda_functions()
         self.state_machine = self._create_state_machine()
         self.api_gateway = self._create_api_gateway()
+
+        # Create Windows Server EC2 instance if enabled
+        if self.ENABLE_WINDOWS_SERVER:
+            self.windows_server_instance = self._create_windows_server_instance()
+        else:
+            self.windows_server_instance = None
 
         self._create_outputs()
 
@@ -426,6 +437,103 @@ class StepFuncProjectStack(Stack):
         )
 
         return http_api
+
+    def _create_windows_server_instance(self) -> ec2.Instance:
+        """Create a Windows Server EC2 instance if enabled in config."""
+        # Lookup latest Windows Server AMI
+        windows_ami = ec2.MachineImage.lookup(
+            name=self.EC2_AMI_NAME,
+            owners=["amazon"]
+        )
+
+        # Pick the subnet from config
+        if self.EC2_SUBNET_NAME and self.EC2_SUBNET_NAME in self.subnets:
+            target_subnet = self.subnets[self.EC2_SUBNET_NAME]
+        else:
+            target_subnet = list(self.subnets.values())[0]
+
+        # Create a security group for the Windows Server
+        ec2_sg = ec2.SecurityGroup(
+            self,
+            f"WindowsServerSG_{self.PROJECT_NAME}",
+            vpc=self.vpc,
+            description="Security group for Windows Server EC2",
+            allow_all_outbound=False  # Restrict outbound traffic
+        )
+
+        # # Allow RDP only from your IP (replace with your actual IP)
+        # ec2_sg.add_ingress_rule(
+        #     peer=ec2.Peer.ipv4(""),  # <-- Replace with your IP
+        #     connection=ec2.Port.tcp(3389),
+        #     description="Allow RDP from my IP"
+        # )
+
+        # Allow outbound PostgreSQL to RDS SG
+        ec2_sg.add_egress_rule(
+            peer=self.security_groups["rds"],  # RDS SG from your existing stack
+            connection=ec2.Port.tcp(self.POSTGRES_PORT),
+            description="Allow outbound PostgreSQL to RDS"
+        )
+
+        # after creating ec2_sg
+        ec2_sg.add_egress_rule(
+            peer=ec2.Peer.ipv4("0.0.0.0/0"),
+            connection=ec2.Port.tcp(443),
+            description="Allow HTTPS egress for SSM via NAT",
+        )
+
+        # Also allow RDS SG to accept inbound from Windows Server SG
+        self.security_groups["rds"].add_ingress_rule(
+            peer=ec2_sg,
+            connection=ec2.Port.tcp(self.POSTGRES_PORT),
+            description="Allow Windows Server to connect to RDS"
+        )
+
+        # Import existing key pair
+        key_pair = ec2.KeyPair.from_key_pair_name(
+            self,
+            f"WindowsServerKeyPair_{self.PROJECT_NAME}",
+            key_pair_name=self.EC2_KEY_NAME
+        )
+        
+        # Create an IAM role for the instance and attach SSM core policy
+        windows_role = iam.Role(
+            self,
+            f"WindowsServerRole_{self.PROJECT_NAME}",
+            role_name=f"WindowsServerRole_{self.PROJECT_NAME}",
+            assumed_by=iam.ServicePrincipal("ec2.amazonaws.com"),
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "AmazonSSMManagedInstanceCore"
+                )
+            ],
+        )
+
+        # Create the EC2 instance
+        instance = ec2.Instance(
+            self,
+            f"WindowsServer_{self.PROJECT_NAME}",
+            instance_type=ec2.InstanceType(self.EC2_INSTANCE_TYPE),
+            machine_image=windows_ami,
+            vpc=self.vpc,
+            vpc_subnets=ec2.SubnetSelection(subnets=[target_subnet]),
+            security_group=ec2_sg,
+            key_pair=key_pair,
+            role=windows_role,
+        )
+
+
+        if instance.connections:
+            CfnOutput(
+                self,
+                f"WindowsServerPrivateIP_{self.PROJECT_NAME}",
+                value=instance.instance_private_ip,
+                description="Private IP of the Windows Server instance",
+                export_name=f"WindowsServerPrivateIP-{self.PROJECT_NAME}",
+            )
+
+        return instance
+
 
     def _create_outputs(self) -> None:
         """Create CloudFormation outputs."""

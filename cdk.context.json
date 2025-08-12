@@ -166,5 +166,6 @@
         ]
       }
     ]
-  }
+  },
+  "ami:account=985936675960:filters.image-type.0=machine:filters.name.0=Windows_Server-2025-English-Full-Base-*:filters.state.0=available:owners.0=amazon:region=us-west-2": "ami-000c270573b170975"
 }

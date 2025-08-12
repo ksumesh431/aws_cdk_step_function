@@ -221,6 +221,8 @@ def lambda_handler(event, context):
                         }
 
         # Proceed with normal processing
+        # In case data is not fresh, pass force_refresh true goinf forward in the flow otherwise next lambdas wont run due to last_update parameter change
+        force_refresh = True
         incidents = fetch_pagerduty_incidents(pagerduty_api_key, days=days)
         if not incidents:
             print("No new incidents found in PagerDuty.")
