@@ -519,7 +519,18 @@ class StepFuncProjectStack(Stack):
             vpc_subnets=ec2.SubnetSelection(subnets=[target_subnet]),
             security_group=ec2_sg,
             key_pair=key_pair,
+            ebs_optimized=True,
             role=windows_role,
+            block_devices=[
+                ec2.BlockDevice(
+                    device_name="/dev/sda1",  # Root volume (C: in Windows)
+                    volume=ec2.BlockDeviceVolume.ebs(
+                        volume_size=45,        # Size in GiB
+                        delete_on_termination=True,
+                        volume_type=ec2.EbsDeviceVolumeType.GP3
+                    ),
+                )
+            ],
         )
 
 
