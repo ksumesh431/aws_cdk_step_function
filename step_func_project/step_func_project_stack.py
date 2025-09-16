@@ -525,7 +525,7 @@ class StepFuncProjectStack(Stack):
                 ec2.BlockDevice(
                     device_name="/dev/sda1",  # Root volume (C: in Windows)
                     volume=ec2.BlockDeviceVolume.ebs(
-                        volume_size=45,        # Size in GiB
+                        volume_size=50,        # Size in GiB
                         delete_on_termination=True,
                         volume_type=ec2.EbsDeviceVolumeType.GP3
                     ),
