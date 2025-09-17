@@ -29,16 +29,17 @@ class PagerDutyIncident(Base):
     restore_time_minutes = Column(Float)
     recover_time_minutes = Column(Float)
 
-    # enums stored as strings
+    # enums/flags stored as strings
     Engineering_time_spent_on_incident = Column(String)
     Number_of_engineers = Column(String)
-    Entity = Column(String)  # note: column name matches your DB
+    Entity = Column(String)
     Platform = Column(String)
     Customer_Experience = Column(String)
     Incident_Category = Column(String)
-    incident_detection_type_auto = Column(String)
-    Pythian_resolution_without_lytx = Column(String)
+    incident_detection_type_auto = Column(String)  # "TRUE"/"FALSE"
+    Pythian_resolution_without_lytx = Column(String)  # "TRUE"/"FALSE"
     Alert_Autoresolved = Column(String)
+    Incident_Resolution = Column(String)
 
     # timestamps
     trigger_time = Column(DateTime(timezone=True))
@@ -79,6 +80,7 @@ CATEGORIES = {
     "Service_Decommission",
     "Saturation",
 }
+BOOL_STR = {"TRUE", "FALSE"}
 
 
 def lambda_handler(event, context):
@@ -88,9 +90,7 @@ def lambda_handler(event, context):
         # Extract parameters from event
         force_refresh = event.get("force_refresh", False)
         freshness_threshold_minutes = event.get("freshness_threshold_minutes", 30)
-        validation_threshold_minutes = event.get(
-            "validation_threshold_minutes", 15
-        )  # Separate threshold for validation
+        validation_threshold_minutes = event.get("validation_threshold_minutes", 15)
 
         print(f"Force refresh: {force_refresh}")
         print(f"Freshness threshold: {freshness_threshold_minutes} minutes")
@@ -110,15 +110,11 @@ def lambda_handler(event, context):
         with Session(engine) as s:
             P = PagerDutyIncident  # alias
 
-            # Check if we need to run validation based on last validation time
+            # Optional quick-exit on recent updates (skip validation)
             if not force_refresh:
-                # Find the most recent validation time (you could track this separately if needed)
-                # For now, we'll use the most recent last_updated as a proxy
                 latest_update = s.query(func.max(P.last_updated)).scalar()
-
                 if latest_update:
                     minutes_since_update = (now - latest_update).total_seconds() / 60
-
                     if minutes_since_update < validation_threshold_minutes:
                         print(
                             f"Data was recently updated ({minutes_since_update:.1f} minutes ago). Skipping validation."
@@ -135,28 +131,7 @@ def lambda_handler(event, context):
 
             print("Proceeding with data validation checks...")
 
-            # # 1) Data Freshness Check
-            # max_updated = s.query(func.max(P.last_updated)).scalar()
-            # if (
-            #     not max_updated
-            #     or (now - max_updated).total_seconds()
-            #     > freshness_threshold_minutes * 60
-            # ):
-            #     failed_checks += 1
-            #     issues.append(
-            #         {
-            #             "check": "data_freshness",
-            #             "max_last_updated": str(max_updated),
-            #             "threshold_minutes": freshness_threshold_minutes,
-            #             "minutes_since_update": (
-            #                 round((now - max_updated).total_seconds() / 60, 1)
-            #                 if max_updated
-            #                 else None
-            #             ),
-            #         }
-            #     )
-
-            # 2) Missing enrichments
+            # 1) Missing enrichments
             missing = (
                 s.query(func.count())
                 .filter(
@@ -169,13 +144,13 @@ def lambda_handler(event, context):
                 failed_checks += 1
                 issues.append({"check": "enrichment_missing", "count": int(missing)})
 
-            # 3) Duplicates (total - distinct)
+            # 2) Duplicates (total - distinct)
             dup = s.query((func.count(P.id) - func.count(func.distinct(P.id)))).scalar()
             if dup and dup > 0:
                 failed_checks += 1
                 issues.append({"check": "duplicates", "count": int(dup)})
 
-            # 4) Enumerations invalid
+            # 3) Enumerations invalid
             bad_enum = (
                 s.query(func.count())
                 .filter(
@@ -193,6 +168,33 @@ def lambda_handler(event, context):
             if bad_enum and bad_enum > 0:
                 failed_checks += 1
                 issues.append({"check": "enum_invalid", "count": int(bad_enum)})
+
+            # 4) Boolean-string fields invalid (if present, must be "TRUE"/"FALSE")
+            invalid_bool = (
+                s.query(func.count())
+                .filter(
+                    or_(
+                        and_(
+                            P.incident_detection_type_auto.isnot(None),
+                            ~func.upper(P.incident_detection_type_auto).in_(
+                                list(BOOL_STR)
+                            ),
+                        ),
+                        and_(
+                            P.Pythian_resolution_without_lytx.isnot(None),
+                            ~func.upper(P.Pythian_resolution_without_lytx).in_(
+                                list(BOOL_STR)
+                            ),
+                        ),
+                    )
+                )
+                .scalar()
+            )
+            if invalid_bool and invalid_bool > 0:
+                failed_checks += 1
+                issues.append(
+                    {"check": "invalid_boolean_strings", "count": int(invalid_bool)}
+                )
 
             # 5) Negative minutes
             negative = (
@@ -242,8 +244,29 @@ def lambda_handler(event, context):
                 failed_checks += 1
                 issues.append({"check": "timestamp_ordering", "count": int(ordering)})
 
-            # 7) Derived minutes drift (all *_minutes fields)
-            tol = 0.01  # minutes = 0.6 seconds to avoid round off errors
+            # 6a) Recovery present without Resolution present
+            recovery_wo_resolution = (
+                s.query(func.count())
+                .filter(
+                    and_(
+                        P.Time_of_Recovery.isnot(None),
+                        P.Time_of_Resolution.is_(None),
+                    )
+                )
+                .scalar()
+            )
+            if recovery_wo_resolution and recovery_wo_resolution > 0:
+                failed_checks += 1
+                issues.append(
+                    {
+                        "check": "recovery_without_resolution",
+                        "count": int(recovery_wo_resolution),
+                    }
+                )
+
+            # 7) Derived minutes drift (use tolerance to ignore tiny rounding errors)
+            tol = 0.01  # minutes (~0.6 seconds)
+
             diff_ack = case(
                 (
                     and_(
@@ -336,11 +359,17 @@ def lambda_handler(event, context):
                 ),
                 else_=0.0,
             )
+            # IMPORTANT: Recover time is Recovery - Resolution (not Trigger)
             diff_recover = case(
                 (
-                    and_(P.Time_of_Recovery.isnot(None), P.trigger_time.isnot(None)),
+                    and_(
+                        P.Time_of_Recovery.isnot(None), P.Time_of_Resolution.isnot(None)
+                    ),
                     func.abs(
-                        (extract("epoch", P.Time_of_Recovery - P.trigger_time) / 60.0)
+                        (
+                            extract("epoch", P.Time_of_Recovery - P.Time_of_Resolution)
+                            / 60.0
+                        )
                         - P.recover_time_minutes
                     ),
                 ),
@@ -387,33 +416,37 @@ def lambda_handler(event, context):
             f"Validation completed. Failed checks: {failed_checks}, Total records: {total_records}"
         )
 
-        # Log summary of issues found
         if issues:
             print("Issues found:")
             for issue in issues:
                 print(f"  - {issue['check']}: {issue.get('count', 'N/A')}")
 
         return {
-            "success": True,  # Always return success unless there's an exception
+            "success": True,  # Keep Step Functions flowing; handle failures via counts
             "skipped": False,
             "failed_checks": failed_checks,
             "issues": issues,
             "validated_at": now.isoformat(),
             "total_records": total_records,
             "validation_summary": {
-                # "data_freshness_ok": not any(
-                #     i["check"] == "data_freshness" for i in issues
-                # ),
                 "no_missing_enrichments": not any(
                     i["check"] == "enrichment_missing" for i in issues
                 ),
                 "no_duplicates": not any(i["check"] == "duplicates" for i in issues),
-                "field_values_valid": not any(i["check"] == "enum_invalid" for i in issues),
+                "field_values_valid": not any(
+                    i["check"] == "enum_invalid" for i in issues
+                ),
+                "boolean_strings_valid": not any(
+                    i["check"] == "invalid_boolean_strings" for i in issues
+                ),
                 "no_negative_durations": not any(
                     i["check"] == "negative_durations" for i in issues
                 ),
                 "timestamps_ordered": not any(
                     i["check"] == "timestamp_ordering" for i in issues
+                ),
+                "no_recovery_without_resolution": not any(
+                    i["check"] == "recovery_without_resolution" for i in issues
                 ),
                 "derived_minutes_accurate": not any(
                     i["check"] == "derived_minutes_drift" for i in issues
@@ -421,7 +454,7 @@ def lambda_handler(event, context):
             },
         }
 
-        # Uncomment this line if you want validation failures to trigger error handling:
+        # If you want Step Functions to branch on validation result, you could instead:
         # return {"success": failed_checks == 0, "failed_checks": failed_checks, "issues": issues, "validated_at": now.isoformat()}
 
     except Exception as e:

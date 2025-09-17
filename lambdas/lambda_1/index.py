@@ -1,6 +1,7 @@
 import os
 import json
 import datetime
+import time
 import requests
 import boto3
 from sqlalchemy import (
@@ -27,13 +28,13 @@ class PagerDutyIncident(Base):
     # --- Columns from First Lambda ---
     id = Column(String, primary_key=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
-    severity = Column(String)
+    severity = Column(String)  # PagerDuty priority (name/summary)
     duration = Column(String)
 
-    # --- NEW: Last Updated Timestamp ---
+    # --- Last Updated Timestamp ---
     last_updated = Column(DateTime(timezone=True), index=True)
 
-    # --- NEW Columns for Enriched Data (from reference code) ---
+    # --- Columns used by enrichment (populated by Lambda 2) ---
     incident_summary = Column(String)
     ack_noc_minutes = Column(Float)
     escalate_noc_minutes = Column(Float)
@@ -42,6 +43,7 @@ class PagerDutyIncident(Base):
     detect_time_minutes = Column(Float)
     restore_time_minutes = Column(Float)
     recover_time_minutes = Column(Float)
+
     Engineering_time_spent_on_incident = Column(String)
     Number_of_engineers = Column(String)
     Entity = Column(String)
@@ -51,8 +53,9 @@ class PagerDutyIncident(Base):
     incident_detection_type_auto = Column(String)
     Pythian_resolution_without_lytx = Column(String)
     Alert_Autoresolved = Column(String)
+    Incident_Resolution = Column(String)  # <-- added to match latest script
 
-    # Timestamps from timeline and custom fields
+    # Timestamps from timeline and custom fields (populated by Lambda 2)
     trigger_time = Column(DateTime(timezone=True))
     noc_acknowledge_time = Column(DateTime(timezone=True))
     noc_escalate_time = Column(DateTime(timezone=True))
@@ -100,21 +103,26 @@ def calculate_duration(start_time_str: str, end_time_str: str) -> str:
     return " ".join(parts) if parts else "0m"
 
 
-def fetch_pagerduty_incidents(api_key: str, days: int = 30) -> list:
-    print(f"Fetching incidents from the last {days} days from PagerDuty...")
-    now = datetime.datetime.now(datetime.timezone.utc)
-    since_time = now - datetime.timedelta(days=days)
-
-    headers = {
+def _pd_headers(api_key: str) -> dict:
+    return {
         "Authorization": f"Token token={api_key}",
         "Accept": "application/vnd.pagerduty+json;version=2",
         "Content-Type": "application/json",
     }
 
-    # --- Pagination Logic ---
+
+def fetch_pagerduty_incidents(api_key: str, days: int = 30) -> list:
+    """
+    Fetch incidents created/updated in the past `days`.
+    Paginates with 'offset'/'limit'. Simple retry for transient HTTP errors.
+    """
+    print(f"Fetching incidents from the last {days} days from PagerDuty...")
+    now = datetime.datetime.now(datetime.timezone.utc)
+    since_time = now - datetime.timedelta(days=days)
+
     all_incidents = []
     offset = 0
-    limit = 100  # The number of results to get per API call
+    limit = 100
 
     while True:
         params = {
@@ -122,32 +130,63 @@ def fetch_pagerduty_incidents(api_key: str, days: int = 30) -> list:
             "until": now.isoformat(),
             "limit": limit,
             "offset": offset,
+            "total": "true",
         }
 
-        response = requests.get(
-            "https://api.pagerduty.com/incidents",
-            headers=headers,
-            params=params,
-            timeout=20,
-        )
-        response.raise_for_status()
-        json_response = response.json()
+        # lightweight retry loop for transient failures
+        for attempt in range(3):
+            try:
+                response = requests.get(
+                    "https://api.pagerduty.com/incidents",
+                    headers=_pd_headers(api_key),
+                    params=params,
+                    timeout=30,
+                )
+                # handle rate limiting explicitly
+                if response.status_code == 429:
+                    wait = min(2**attempt, 8)
+                    print(f"Rate limited (429). Backing off {wait}s...")
+                    time.sleep(wait)
+                    continue
 
-        # Add the fetched incidents to our master list
-        incidents_on_page = json_response.get("incidents", [])
+                response.raise_for_status()
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt == 2:
+                    raise
+                wait = min(2**attempt, 8)
+                print(f"Fetch attempt {attempt+1} failed: {e}. Retrying in {wait}s...")
+                time.sleep(wait)
+
+        data = response.json()
+        incidents_on_page = data.get("incidents", [])
         if not incidents_on_page:
-            break  # Stop if a page is empty for any reason
+            # if 'more' is True but we got an empty page, stop to avoid loops
+            if data.get("more"):
+                print(
+                    "Warning: API indicated more results but page was empty. Stopping."
+                )
+            break
 
         all_incidents.extend(incidents_on_page)
 
-        # Check if there are more pages to fetch
-        if not json_response.get("more"):
-            break  # Exit the loop if the 'more' flag is false or missing
+        # Paging
+        more = bool(data.get("more"))
+        total = data.get("total")
+        print(
+            f"Fetched {len(incidents_on_page)} (offset={offset}). Total so far: {len(all_incidents)}"
+        )
 
-        # Prepare for the next iteration
-        offset += limit
-        print(f"Fetched {len(all_incidents)} incidents so far, getting next page...")
+        if more:
+            offset += limit
+        else:
+            # as a fallback, if total present, verify we fetched all
+            if total is not None and len(all_incidents) < int(total):
+                offset += limit
+                continue
+            break
 
+    print(f"Total incidents fetched: {len(all_incidents)}")
     return all_incidents
 
 
@@ -169,6 +208,7 @@ def lambda_handler(event, context):
 
         print(f"Force refresh: {force_refresh}")
         print(f"Freshness threshold: {freshness_threshold_minutes} minutes")
+        print(f"Window (days): {days}")
 
         # Get secrets and database connection
         pagerduty_secret_payload = secrets_client.get_secret_value(
@@ -176,7 +216,6 @@ def lambda_handler(event, context):
         )
         pagerduty_secret = json.loads(pagerduty_secret_payload["SecretString"])
         pagerduty_api_key = pagerduty_secret.get("API_KEY")
-
         if not pagerduty_api_key:
             raise KeyError(
                 "Secret from Secrets Manager does not contain the key 'API_KEY'"
@@ -189,23 +228,21 @@ def lambda_handler(event, context):
         engine = get_engine(db_secret)
         Base.metadata.create_all(engine)
 
-        # Create index if it doesn't exist
+        # Ensure index exists
         meta = MetaData()
         tbl = Table("pagerduty_incidents", meta, autoload_with=engine)
         idx = Index("ix_pdi_last_updated", tbl.c.last_updated)
         idx.create(bind=engine, checkfirst=True)
 
-        # Check if we need to refresh based on last_updated
+        # Freshness gate: skip if recently updated (unless force_refresh)
         if not force_refresh:
             with Session(engine) as session:
                 latest_update = session.query(
                     func.max(PagerDutyIncident.last_updated)
                 ).scalar()
-
                 if latest_update:
                     now = datetime.datetime.now(datetime.timezone.utc)
                     minutes_since_update = (now - latest_update).total_seconds() / 60
-
                     if minutes_since_update < freshness_threshold_minutes:
                         print(
                             f"Data is fresh (updated {minutes_since_update:.1f} minutes ago). Skipping refresh."
@@ -214,58 +251,68 @@ def lambda_handler(event, context):
                             "success": True,
                             "skipped": True,
                             "reason": "data_is_fresh",
-                            "force_refresh": force_refresh,
+                            "force_refresh": False,  # unchanged here
                             "freshness_threshold_minutes": freshness_threshold_minutes,
                             "minutes_since_update": round(minutes_since_update, 1),
                             "incidents_processed": 0,
                         }
 
         # Proceed with normal processing
-        # In case data is not fresh, pass force_refresh true goinf forward in the flow otherwise next lambdas wont run due to last_update parameter change
+        # Important: set force_refresh True so downstream steps will run
         force_refresh = True
+
         incidents = fetch_pagerduty_incidents(pagerduty_api_key, days=days)
         if not incidents:
-            print("No new incidents found in PagerDuty.")
+            print("No incidents returned by PagerDuty.")
             return {
                 "success": True,
                 "incidents_processed": 0,
-                "message": "No new incidents found.",
+                "message": "No incidents found in the requested window.",
                 "force_refresh": force_refresh,
                 "freshness_threshold_minutes": freshness_threshold_minutes,
             }
 
         print(
-            f"Fetched {len(incidents)} incidents from PagerDuty. Processing for database."
+            f"Fetched {len(incidents)} incidents from PagerDuty. Upserting into database..."
         )
 
         # Process and save incidents
+        now_ts = datetime.datetime.now(datetime.timezone.utc)
+        upserted = 0
         with Session(engine) as session:
             for incident_data in incidents:
-                incident_to_save = PagerDutyIncident(
-                    id=incident_data.get("id"),
-                    created_at=datetime.datetime.fromisoformat(
-                        incident_data.get("created_at").replace("Z", "+00:00")
-                    ),
-                    severity=(incident_data.get("priority") or {}).get(
-                        "summary", "N/A"
-                    ),
-                    duration=calculate_duration(
-                        incident_data.get("created_at"),
-                        incident_data.get("resolved_at"),
-                    ),
-                    last_updated=datetime.datetime.now(
-                        datetime.timezone.utc
-                    ),  # Set last_updated
+                created_at_raw = incident_data.get("created_at")
+                resolved_at_raw = incident_data.get("resolved_at")
+
+                created_at = (
+                    datetime.datetime.fromisoformat(
+                        created_at_raw.replace("Z", "+00:00")
+                    )
+                    if created_at_raw
+                    else now_ts
                 )
-                session.merge(incident_to_save)
+
+                priority = incident_data.get("priority") or {}
+                severity_val = priority.get("name") or priority.get("summary") or "N/A"
+
+                row = PagerDutyIncident(
+                    id=incident_data.get("id"),
+                    created_at=created_at,
+                    severity=severity_val,
+                    duration=calculate_duration(created_at_raw, resolved_at_raw),
+                    last_updated=now_ts,
+                )
+                session.merge(row)
+                upserted += 1
+
             session.commit()
 
-        print(f"SUCCESS: Processed and saved/updated {len(incidents)} incidents.")
+        print(f"SUCCESS: Upserted {upserted} incidents.")
         return {
             "success": True,
             "force_refresh": force_refresh,
             "freshness_threshold_minutes": freshness_threshold_minutes,
-            "incidents_processed": len(incidents),
+            "incidents_processed": upserted,
         }
 
     except Exception as exc:

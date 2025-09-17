@@ -1,22 +1,18 @@
 import os
 import json
+import time
 import datetime
 import requests
-import concurrent.futures  # Import the concurrency library
+import concurrent.futures
 
 import boto3
 from sqlalchemy import create_engine, Index, Column, String, DateTime, Float, func
 from sqlalchemy.orm import declarative_base, Session
-from sqlalchemy.exc import SQLAlchemyError
 
-# --- Configuration for Concurrency ---
-# Start with a conservative number. PagerDuty has API rate limits.
-# 10 is a reasonable starting point.
-MAX_WORKERS = 15
+# --- Concurrency ---
+MAX_WORKERS = 13
 
-# --- SQLAlchemy Model and Helper functions are IDENTICAL to your original code ---
-# (Keeping them here for completeness)
-
+# --- ORM Model (aligned with Lambda 1) ---
 Base = declarative_base()
 
 
@@ -24,16 +20,14 @@ class PagerDutyIncident(Base):
     __tablename__ = "pagerduty_incidents"
     __table_args__ = (Index("ix_pdi_last_updated", "last_updated"),)
 
-    # --- Columns from First Lambda ---
     id = Column(String, primary_key=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
     severity = Column(String)
     duration = Column(String)
 
-    # --- NEW: Last Updated Timestamp ---
     last_updated = Column(DateTime(timezone=True), index=True)
 
-    # --- NEW Columns for Enriched Data (from reference code) ---
+    # Enriched fields
     incident_summary = Column(String)
     ack_noc_minutes = Column(Float)
     escalate_noc_minutes = Column(Float)
@@ -42,6 +36,7 @@ class PagerDutyIncident(Base):
     detect_time_minutes = Column(Float)
     restore_time_minutes = Column(Float)
     recover_time_minutes = Column(Float)
+
     Engineering_time_spent_on_incident = Column(String)
     Number_of_engineers = Column(String)
     Entity = Column(String)
@@ -51,8 +46,9 @@ class PagerDutyIncident(Base):
     incident_detection_type_auto = Column(String)
     Pythian_resolution_without_lytx = Column(String)
     Alert_Autoresolved = Column(String)
+    Incident_Resolution = Column(String)  # included per latest script
 
-    # Timestamps from timeline and custom fields
+    # Timeline + custom timestamps
     trigger_time = Column(DateTime(timezone=True))
     noc_acknowledge_time = Column(DateTime(timezone=True))
     noc_escalate_time = Column(DateTime(timezone=True))
@@ -64,7 +60,6 @@ class PagerDutyIncident(Base):
 
 
 def get_engine(secret: dict):
-    # ... (No changes needed) ...
     user, password, host, port = (
         secret["username"],
         secret["password"],
@@ -77,11 +72,10 @@ def get_engine(secret: dict):
 
 
 # ==============================================================================
-# === PAGERDUTY CORE LOGIC (FROM YOUR REFERENCE CODE) ===
+# === PAGERDUTY CORE LOGIC (aligned with your manual script) ===
 # ==============================================================================
-
-# --- Configuration ---
 BASE_URL = "https://api.pagerduty.com"
+
 TARGET_CUSTOM_FIELD_DISPLAY_NAMES = [
     "Time_of_Detection",
     "Time_of_Resolution",
@@ -95,7 +89,9 @@ TARGET_CUSTOM_FIELD_DISPLAY_NAMES = [
     "incident_detection_type_auto",
     "Pythian_resolution_without_lytx",
     "Alert_Autoresolved",
+    "Incident_Resolution",
 ]
+
 PYTHIAN_SRE_USERS = [
     "Anand Kamath",
     "Rachana Rangineni",
@@ -105,6 +101,8 @@ PYTHIAN_SRE_USERS = [
     "Vikas Vats",
     "Jason Ramsey",
 ]
+
+# OLD categories (still used in codebase per your note)
 INCIDENT_CATEGORIES = [
     "Release",
     "Deficient_Maintainence",
@@ -116,13 +114,12 @@ INCIDENT_CATEGORIES = [
     "Service_Decommission",
     "Saturation",
 ]
+
 ENTITIES = ["WNS", "Drivecam", "Surfsight"]
 PLATFORMS = ["AWS", "Onprem", "Thirdparty"]
-# --- End of Configuration ---
 
 
-def get_headers(api_key):
-    """Generates the headers dictionary dynamically."""
+def _pd_headers(api_key: str) -> dict:
     return {
         "Authorization": f"Token token={api_key}",
         "Accept": "application/vnd.pagerduty+json;version=2",
@@ -130,16 +127,37 @@ def get_headers(api_key):
     }
 
 
+def _retrying_get(
+    url: str, headers: dict, params: dict, timeout: int = 30, max_attempts: int = 3
+):
+    for attempt in range(max_attempts):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+            if resp.status_code == 429:
+                wait = min(2**attempt, 8)
+                print(f"[429] Rate limited at {url}. Backing off {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            if attempt == max_attempts - 1:
+                raise
+            wait = min(2**attempt, 8)
+            print(
+                f"GET {url} failed (attempt {attempt+1}/{max_attempts}): {e}. Retrying in {wait}s..."
+            )
+            time.sleep(wait)
+    return None  # not reached
+
+
 def get_incident_details_with_custom_fields(incident_id, api_key):
-    incident_url = f"{BASE_URL}/incidents/{incident_id}"
+    url = f"{BASE_URL}/incidents/{incident_id}"
     params = {"include[]": "custom_fields"}
     try:
-        response = requests.get(
-            incident_url, headers=get_headers(api_key), params=params, timeout=30
-        )
-        response.raise_for_status()
-        return response.json().get("incident")
-    except requests.exceptions.RequestException as e:
+        resp = _retrying_get(url, headers=_pd_headers(api_key), params=params)
+        return resp.json().get("incident") if resp is not None else None
+    except Exception as e:
         print(f"Error fetching details for incident {incident_id}: {e}")
         return None
 
@@ -148,7 +166,7 @@ def get_incident_log_entries(incident_id, api_key):
     all_log_entries = []
     offset = 0
     limit = 100
-    log_entries_url = f"{BASE_URL}/incidents/{incident_id}/log_entries"
+    url = f"{BASE_URL}/incidents/{incident_id}/log_entries"
     while True:
         params = {
             "offset": offset,
@@ -157,19 +175,23 @@ def get_incident_log_entries(incident_id, api_key):
             "include[]": ["channels"],
         }
         try:
-            response = requests.get(
-                log_entries_url, headers=get_headers(api_key), params=params, timeout=30
-            )
-            response.raise_for_status()
-            data = response.json()
-            log_entries_page = data.get("log_entries", [])
-            all_log_entries.extend(log_entries_page)
+            resp = _retrying_get(url, headers=_pd_headers(api_key), params=params)
+            if resp is None:
+                return all_log_entries
+            data = resp.json()
+            page = data.get("log_entries", [])
+            all_log_entries.extend(page)
             if not data.get("more", False):
                 break
-            offset += len(log_entries_page)
-        except requests.exceptions.RequestException as e:
+            if not page:
+                print(
+                    f"Warning: API indicates more entries for {incident_id} but returned empty page. Stopping."
+                )
+                break
+            offset += len(page)
+        except Exception as e:
             print(f"Error fetching logs for incident {incident_id}: {e}")
-            return []
+            return all_log_entries
     return all_log_entries
 
 
@@ -177,6 +199,7 @@ def parse_iso_datetime(timestamp_str):
     if not timestamp_str:
         return None
     try:
+        # supports "...Z" & "+00:00"
         return datetime.datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         print(f"Warning: Could not parse timestamp: {timestamp_str}")
@@ -184,49 +207,94 @@ def parse_iso_datetime(timestamp_str):
 
 
 def extract_data_from_timeline(log_entries):
-    extracted_times = {
+    """
+    Matches your manual script:
+    - Records earliest trigger/ack/escalate times
+    - Distinguishes NOC ('Pythian PagerDuty') vs SRE (name in PYTHIAN_SRE_USERS)
+    - If not escalated by agent, checks assignees
+    """
+    extracted = {
         "trigger_time": None,
         "noc_acknowledge_time": None,
         "noc_escalate_time": None,
         "pythian_sre_acknowledge_time": None,
         "pythian_sre_escalate_time": None,
     }
+
     for entry in log_entries:
         entry_type = entry.get("type")
         created_at = entry.get("created_at")
         if not created_at:
             continue
 
-        agent_summary = (entry.get("agent") or {}).get("summary")
+        agent_info = entry.get("agent") or {}
+        agent_type = agent_info.get("type")
+        agent_summary = agent_info.get("summary")
 
-        if entry_type == "trigger_log_entry" and not extracted_times["trigger_time"]:
-            extracted_times["trigger_time"] = created_at
+        if entry_type == "trigger_log_entry":
+            if (
+                extracted["trigger_time"] is None
+                or created_at < extracted["trigger_time"]
+            ):
+                extracted["trigger_time"] = created_at
+
         elif entry_type == "acknowledge_log_entry":
-            if (
-                agent_summary == "Pythian PagerDuty"
-                and not extracted_times["noc_acknowledge_time"]
-            ):
-                extracted_times["noc_acknowledge_time"] = created_at
-            elif (
-                agent_summary in PYTHIAN_SRE_USERS
-                and not extracted_times["pythian_sre_acknowledge_time"]
-            ):
-                extracted_times["pythian_sre_acknowledge_time"] = created_at
+            if agent_type == "user_reference":
+                if agent_summary == "Pythian PagerDuty":
+                    if (
+                        extracted["noc_acknowledge_time"] is None
+                        or created_at < extracted["noc_acknowledge_time"]
+                    ):
+                        extracted["noc_acknowledge_time"] = created_at
+                elif agent_summary in PYTHIAN_SRE_USERS:
+                    if (
+                        extracted["pythian_sre_acknowledge_time"] is None
+                        or created_at < extracted["pythian_sre_acknowledge_time"]
+                    ):
+                        extracted["pythian_sre_acknowledge_time"] = created_at
+
         elif entry_type == "escalate_log_entry":
-            if (
-                agent_summary == "Pythian PagerDuty"
-                and not extracted_times["noc_escalate_time"]
-            ):
-                extracted_times["noc_escalate_time"] = created_at
-            elif (
-                agent_summary in PYTHIAN_SRE_USERS
-                and not extracted_times["pythian_sre_escalate_time"]
-            ):
-                extracted_times["pythian_sre_escalate_time"] = created_at
-    return extracted_times
+            escalated_by_user_agent = False
+            if agent_type == "user_reference":
+                if agent_summary == "Pythian PagerDuty":
+                    if (
+                        extracted["noc_escalate_time"] is None
+                        or created_at < extracted["noc_escalate_time"]
+                    ):
+                        extracted["noc_escalate_time"] = created_at
+                        escalated_by_user_agent = True
+                elif agent_summary in PYTHIAN_SRE_USERS:
+                    if (
+                        extracted["pythian_sre_escalate_time"] is None
+                        or created_at < extracted["pythian_sre_escalate_time"]
+                    ):
+                        extracted["pythian_sre_escalate_time"] = created_at
+                        escalated_by_user_agent = True
+
+            if not escalated_by_user_agent:
+                assignees = entry.get("assignees", [])
+                for assignee in assignees:
+                    if assignee.get("type") == "user_reference":
+                        s = assignee.get("summary")
+                        if s == "Pythian PagerDuty":
+                            if (
+                                extracted["noc_escalate_time"] is None
+                                or created_at < extracted["noc_escalate_time"]
+                            ):
+                                extracted["noc_escalate_time"] = created_at
+                        elif s in PYTHIAN_SRE_USERS:
+                            if (
+                                extracted["pythian_sre_escalate_time"] is None
+                                or created_at < extracted["pythian_sre_escalate_time"]
+                            ):
+                                extracted["pythian_sre_escalate_time"] = created_at
+
+    return extracted
 
 
 def calculate_time_difference_minutes(end_time_str, start_time_str):
+    if start_time_str is None or end_time_str is None:
+        return None
     start_dt = parse_iso_datetime(start_time_str)
     end_dt = parse_iso_datetime(end_time_str)
     if not start_dt or not end_dt:
@@ -235,75 +303,114 @@ def calculate_time_difference_minutes(end_time_str, start_time_str):
 
 
 def process_single_incident(incident_id, api_key):
-    """Worker function to process a single incident and return a dictionary of fields to update."""
+    """
+    Fetches details, logs, and computes enriched metrics for one incident.
+    Returns a dict to upsert into the DB.
+    """
     incident_details = get_incident_details_with_custom_fields(incident_id, api_key)
     if not incident_details:
         return None
 
+    # Custom fields extraction (initialize all to None)
     custom_fields = {key: None for key in TARGET_CUSTOM_FIELD_DISPLAY_NAMES}
-    for field in incident_details.get("custom_fields", []):
-        if (display_name := field.get("display_name")) in custom_fields:
-            custom_fields[display_name] = field.get("value")
+    for field in incident_details.get("custom_fields") or []:
+        if isinstance(field, dict):
+            dn = field.get("display_name")
+            if dn in custom_fields:
+                custom_fields[dn] = field.get("value")
 
+    # Logs → timeline
     incident_logs = get_incident_log_entries(incident_id, api_key)
     timeline = extract_data_from_timeline(incident_logs)
 
-    metrics = {}
     trigger_time = timeline.get("trigger_time")
+    noc_ack = timeline.get("noc_acknowledge_time")
+    noc_esc = timeline.get("noc_escalate_time")
+    sre_ack = timeline.get("pythian_sre_acknowledge_time")
+    sre_esc = timeline.get("pythian_sre_escalate_time")
 
-    metrics["ack_noc_minutes"] = calculate_time_difference_minutes(
-        timeline.get("noc_acknowledge_time"), trigger_time
-    )
-    metrics["escalate_noc_minutes"] = calculate_time_difference_minutes(
-        timeline.get("noc_escalate_time"), timeline.get("noc_acknowledge_time")
-    )
-    metrics["ack_pythian_sre_minutes"] = calculate_time_difference_minutes(
-        timeline.get("pythian_sre_acknowledge_time"), timeline.get("noc_escalate_time")
-    )
-    metrics["escalate_pythian_sre_minutes"] = calculate_time_difference_minutes(
-        timeline.get("pythian_sre_escalate_time"),
-        timeline.get("pythian_sre_acknowledge_time"),
-    )
-    metrics["detect_time_minutes"] = calculate_time_difference_minutes(
+    # Metrics
+    ack_noc_minutes = calculate_time_difference_minutes(noc_ack, trigger_time)
+    escalate_noc_minutes = calculate_time_difference_minutes(noc_esc, noc_ack)
+    if escalate_noc_minutes is not None and escalate_noc_minutes < 0:
+        # fallback to trigger baseline like your script
+        escalate_noc_minutes = calculate_time_difference_minutes(noc_esc, trigger_time)
+
+    ack_pythian_sre_minutes = calculate_time_difference_minutes(sre_ack, noc_esc)
+    if ack_pythian_sre_minutes is not None and ack_pythian_sre_minutes < 0:
+        ack_pythian_sre_minutes = calculate_time_difference_minutes(
+            sre_ack, trigger_time
+        )
+
+    escalate_pythian_sre_minutes = calculate_time_difference_minutes(sre_esc, sre_ack)
+    if escalate_pythian_sre_minutes is not None and escalate_pythian_sre_minutes < 0:
+        escalate_pythian_sre_minutes = calculate_time_difference_minutes(
+            sre_esc, trigger_time
+        )
+
+    detect_time_minutes = calculate_time_difference_minutes(
         custom_fields.get("Time_of_Detection"), trigger_time
     )
-    metrics["restore_time_minutes"] = calculate_time_difference_minutes(
+    restore_time_minutes = calculate_time_difference_minutes(
         custom_fields.get("Time_of_Resolution"), trigger_time
     )
-    metrics["recover_time_minutes"] = calculate_time_difference_minutes(
-        custom_fields.get("Time_of_Recovery"), trigger_time
+    # IMPORTANT: Recover time is Recovery - Resolution (updated logic)
+    recover_time_minutes = calculate_time_difference_minutes(
+        custom_fields.get("Time_of_Recovery"), custom_fields.get("Time_of_Resolution")
     )
 
-    db_update_data = {
+    # Base DB update dict
+    db_update = {
         "id": incident_id,
         "incident_summary": incident_details.get("title"),
-        **metrics,
-        **{k: v for k, v in custom_fields.items() if v is not None},
+        "ack_noc_minutes": ack_noc_minutes,
+        "escalate_noc_minutes": escalate_noc_minutes,
+        "ack_pythian_sre_minutes": ack_pythian_sre_minutes,
+        "escalate_pythian_sre_minutes": escalate_pythian_sre_minutes,
+        "detect_time_minutes": detect_time_minutes,
+        "restore_time_minutes": restore_time_minutes,
+        "recover_time_minutes": recover_time_minutes,
+        # timeline timestamps
         **{k: parse_iso_datetime(v) for k, v in timeline.items() if v is not None},
     }
 
-    db_update_data["Time_of_Detection"] = parse_iso_datetime(
+    # Custom fields → DB: include even if None for completeness, but set some defaults
+    # Defaults for booleans-as-strings
+    for key in ("incident_detection_type_auto", "Pythian_resolution_without_lytx"):
+        val = custom_fields.get(key)
+        db_update[key] = "FALSE" if val is None else val
+
+    # Pass-through fields
+    passthrough = [
+        "Engineering_time_spent_on_incident",
+        "Number_of_engineers",
+        "Customer_Experience",
+        "Alert_Autoresolved",
+        "Incident_Resolution",
+    ]
+    for key in passthrough:
+        db_update[key] = custom_fields.get(key)
+
+    # Enum-restricted fields
+    if custom_fields.get("Entity") in ENTITIES:
+        db_update["Entity"] = custom_fields.get("Entity")
+    if custom_fields.get("Platform") in PLATFORMS:
+        db_update["Platform"] = custom_fields.get("Platform")
+    if custom_fields.get("Incident_Category") in INCIDENT_CATEGORIES:
+        db_update["Incident_Category"] = custom_fields.get("Incident_Category")
+
+    # Custom timestamp fields
+    db_update["Time_of_Detection"] = parse_iso_datetime(
         custom_fields.get("Time_of_Detection")
     )
-    db_update_data["Time_of_Resolution"] = parse_iso_datetime(
+    db_update["Time_of_Resolution"] = parse_iso_datetime(
         custom_fields.get("Time_of_Resolution")
     )
-    db_update_data["Time_of_Recovery"] = parse_iso_datetime(
+    db_update["Time_of_Recovery"] = parse_iso_datetime(
         custom_fields.get("Time_of_Recovery")
     )
 
-    for field_name in ["Entity", "Platform", "Incident_Category"]:
-        if val := custom_fields.get(field_name):
-            if (
-                (field_name == "Entity" and val in ENTITIES)
-                or (field_name == "Platform" and val in PLATFORMS)
-                or (field_name == "Incident_Category" and val in INCIDENT_CATEGORIES)
-            ):
-                db_update_data[field_name] = val
-            else:
-                db_update_data.pop(field_name, None)
-
-    return db_update_data
+    return db_update
 
 
 secrets_client = boto3.client("secretsmanager")
@@ -312,7 +419,7 @@ secrets_client = boto3.client("secretsmanager")
 # === Main Lambda Handler ===
 def lambda_handler(event, context):
     try:
-        print("=== PagerDuty Incident ENRICHMENT Lambda Started (Concurrent Mode) ===")
+        print("=== PagerDuty Incident ENRICHMENT Lambda Started (Parallel) ===")
 
         # Extract parameters from event
         force_refresh = event.get("force_refresh", False)
@@ -321,7 +428,7 @@ def lambda_handler(event, context):
         print(f"Force refresh: {force_refresh}")
         print(f"Freshness threshold: {freshness_threshold_minutes} minutes")
 
-        # Get secrets and setup
+        # Secrets
         pagerduty_secret_payload = secrets_client.get_secret_value(
             SecretId="pagerduty/API_KEY"
         )
@@ -336,67 +443,57 @@ def lambda_handler(event, context):
         engine = get_engine(db_secret)
         Base.metadata.create_all(engine)
 
+        # Choose incidents to enrich
         with Session(engine) as session:
-            # Check freshness if not forcing refresh
             if not force_refresh:
-                # Check if we have recent enrichments
                 latest_enrichment = (
                     session.query(func.max(PagerDutyIncident.last_updated))
-                    .filter(
-                        PagerDutyIncident.incident_summary.isnot(None)
-                    )  # Only enriched records
+                    .filter(PagerDutyIncident.incident_summary.isnot(None))
                     .scalar()
                 )
-
                 if latest_enrichment:
                     now = datetime.datetime.now(datetime.timezone.utc)
-                    minutes_since_enrichment = (
-                        now - latest_enrichment
-                    ).total_seconds() / 60
-
-                    if minutes_since_enrichment < freshness_threshold_minutes:
+                    minutes_since = (now - latest_enrichment).total_seconds() / 60
+                    if minutes_since < freshness_threshold_minutes:
                         print(
-                            f"Enriched data is fresh (updated {minutes_since_enrichment:.1f} minutes ago). Skipping enrichment."
+                            f"Enriched data is fresh ({minutes_since:.1f} minutes). Skipping enrichment."
                         )
                         return {
                             "success": True,
                             "skipped": True,
                             "reason": "enriched_data_is_fresh",
-                            "minutes_since_enrichment": round(
-                                minutes_since_enrichment, 1
-                            ),
+                            "minutes_since_enrichment": round(minutes_since, 1),
                             "incidents_updated": 0,
                             "force_refresh": force_refresh,
                             "freshness_threshold_minutes": freshness_threshold_minutes,
                         }
 
-            # Find incidents to enrich
             if force_refresh:
-                # If forcing refresh, enrich all incidents (or recent ones)
+                # Re-enrich all useful incidents (filter out empty placeholders)
                 incidents_to_enrich = (
                     session.query(PagerDutyIncident)
                     .filter(PagerDutyIncident.severity != "N/A")
                     .all()
                 )
                 print(
-                    f"Force refresh: Found {len(incidents_to_enrich)} total incidents to re-enrich"
+                    f"Force refresh: {len(incidents_to_enrich)} incidents to re-enrich."
                 )
             else:
-                # Normal mode: only enrich incidents missing enrichment data
+                # Only those missing enrichment
                 incidents_to_enrich = (
                     session.query(PagerDutyIncident)
                     .filter(
                         PagerDutyIncident.severity != "N/A",
-                        PagerDutyIncident.incident_summary == None,
+                        PagerDutyIncident.incident_summary.is_(None),
                     )
                     .all()
                 )
                 print(
-                    f"Normal mode: Found {len(incidents_to_enrich)} incidents needing enrichment"
+                    f"Normal mode: {len(incidents_to_enrich)} incidents need enrichment."
                 )
 
         if not incidents_to_enrich:
-            print("No incidents to enrich found in the database.")
+            print("No incidents to enrich found.")
             return {
                 "success": True,
                 "message": "No incidents to enrich.",
@@ -405,32 +502,29 @@ def lambda_handler(event, context):
                 "freshness_threshold_minutes": freshness_threshold_minutes,
             }
 
-        # Extract incident IDs for processing
-        incident_ids = [incident.id for incident in incidents_to_enrich]
-        print(f"Processing {len(incident_ids)} incidents with parallel processing.")
+        incident_ids = [i.id for i in incidents_to_enrich]
+        print(f"Processing {len(incident_ids)} incidents with {MAX_WORKERS} workers...")
 
-        # Process incidents in parallel (existing logic)
-        all_enriched_data = []
+        all_enriched = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_id = {
                 executor.submit(
-                    process_single_incident, incident_id, pagerduty_api_key
-                ): incident_id
-                for incident_id in incident_ids
+                    process_single_incident, inc_id, pagerduty_api_key
+                ): inc_id
+                for inc_id in incident_ids
             }
-
             for future in concurrent.futures.as_completed(future_to_id):
-                incident_id = future_to_id[future]
+                inc_id = future_to_id[future]
                 try:
-                    enriched_data = future.result()
-                    if enriched_data:
-                        all_enriched_data.append(enriched_data)
+                    res = future.result()
+                    if res:
+                        all_enriched.append(res)
                     else:
-                        print(f"Worker for incident {incident_id} returned no data.")
-                except Exception as exc:
-                    print(f"Incident {incident_id} generated an exception: {exc}")
+                        print(f"Incident {inc_id}: no enrichment produced.")
+                except Exception as e:
+                    print(f"Incident {inc_id} raised exception: {e}")
 
-        if not all_enriched_data:
+        if not all_enriched:
             print("No incidents were successfully enriched.")
             return {
                 "success": True,
@@ -440,27 +534,25 @@ def lambda_handler(event, context):
                 "freshness_threshold_minutes": freshness_threshold_minutes,
             }
 
-        # Update database
-        updated_count = 0
+        # Upsert into DB
+        now_ts = datetime.datetime.now(datetime.timezone.utc)
+        updated = 0
         with Session(engine) as session:
-            print(
-                f"Updating {len(all_enriched_data)} enriched incidents in the database..."
-            )
-            for data in all_enriched_data:
-                data["last_updated"] = datetime.datetime.now(datetime.timezone.utc)
+            for data in all_enriched:
+                data["last_updated"] = now_ts
                 session.merge(PagerDutyIncident(**data))
-                updated_count += 1
+                updated += 1
             session.commit()
 
-        print(f"SUCCESS: Processed and updated {updated_count} incidents.")
+        print(f"SUCCESS: Updated {updated} incidents with enriched data.")
         return {
             "success": True,
-            "incidents_updated": updated_count,
+            "incidents_updated": updated,
             "force_refresh": force_refresh,
             "freshness_threshold_minutes": freshness_threshold_minutes,
         }
 
     except Exception as exc:
-        error_message = f"An unexpected error occurred in the handler: {exc}"
+        error_message = f"An unexpected error occurred in Lambda 2: {exc}"
         print(error_message)
         return {"success": False, "error": str(exc), "type": exc.__class__.__name__}
