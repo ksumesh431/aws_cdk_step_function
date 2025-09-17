@@ -10,7 +10,7 @@ aws:
 # Windows EC2 Instance Configuration
 ec2:
   enable_windows_server: true   # Set to false to skip creating the instance
-  instance_type: t3.medium
+  instance_type: t3.xlarge
   key_name: pagerduty-win-admin-key
   ami_name: Windows_Server-2022-English-Full-Base-*  # AWS Windows AMI pattern
   subnet_name: private_subnet_1  # Which subnet from subnets config to use

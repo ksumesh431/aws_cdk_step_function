@@ -458,7 +458,7 @@ class StepFuncProjectStack(Stack):
             f"WindowsServerSG_{self.PROJECT_NAME}",
             vpc=self.vpc,
             description="Security group for Windows Server EC2",
-            allow_all_outbound=False  # Restrict outbound traffic
+            allow_all_outbound=True  # Restrict outbound traffic
         )
 
         # # Allow RDP only from your IP (replace with your actual IP)
