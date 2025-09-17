@@ -16,7 +16,7 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import declarative_base, Session
-
+from sqlalchemy import text
 # === SQLAlchemy Setup: Define the Database Table Model ===
 Base = declarative_base()
 
@@ -65,6 +65,39 @@ class PagerDutyIncident(Base):
     Time_of_Resolution = Column(DateTime(timezone=True))
     Time_of_Recovery = Column(DateTime(timezone=True))
 
+
+
+# Alter function
+def ensure_expected_columns(engine):
+    """
+    Ensure new columns added to the ORM also exist in the DB table.
+    This is a lightweight migration helper for simple additive schema changes.
+    """
+    expected_columns_sql = {
+        # name -> postgres SQL type
+        # (only adding new ones you introduced after the table already existed)
+        "Incident_Resolution": "VARCHAR",
+        # If you add more columns in the future, list them here, e.g.:
+        # "Some_New_Column": "VARCHAR",
+    }
+
+    with engine.begin() as conn:
+        # fetch existing column names (case-sensitive for quoted identifiers)
+        existing = set()
+        rows = conn.execute(text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'pagerduty_incidents'
+        """)).fetchall()
+        existing = {r[0] for r in rows}
+
+        for col_name, col_type in expected_columns_sql.items():
+            if col_name not in existing:
+                # Use quoted identifier for mixed-case names
+                sql = f'ALTER TABLE pagerduty_incidents ADD COLUMN IF NOT EXISTS "{col_name}" {col_type}'
+                print(f"Applying schema change: {sql}")
+                conn.execute(text(sql))
 
 # === Database Connection Function ===
 def get_engine(secret: dict):
@@ -227,6 +260,7 @@ def lambda_handler(event, context):
 
         engine = get_engine(db_secret)
         Base.metadata.create_all(engine)
+        ensure_expected_columns(engine)
 
         # Ensure index exists
         meta = MetaData()

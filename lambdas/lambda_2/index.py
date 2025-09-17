@@ -8,6 +8,7 @@ import concurrent.futures
 import boto3
 from sqlalchemy import create_engine, Index, Column, String, DateTime, Float, func
 from sqlalchemy.orm import declarative_base, Session
+from sqlalchemy import text
 
 # --- Concurrency ---
 MAX_WORKERS = 13
@@ -69,6 +70,36 @@ def get_engine(secret: dict):
     dbname = os.environ.get("DB_NAME", "postgres")
     url = f"postgresql+pg8000://{user}:{password}@{host}:{port}/{dbname}"
     return create_engine(url, pool_pre_ping=True, future=True)
+
+
+def ensure_expected_columns(engine):
+    """
+    Ensure new columns added to the ORM also exist in the DB table.
+    This is a lightweight migration helper for simple additive schema changes.
+    """
+    expected_columns_sql = {
+        # Additive columns introduced after the table already existed:
+        "Incident_Resolution": "VARCHAR",
+        # If you add more in the future, list them here:
+        # "Some_New_Column": "VARCHAR",
+        # "Some_New_Float": "DOUBLE PRECISION",
+        # "Some_New_Timestamp": "TIMESTAMPTZ",
+    }
+
+    with engine.begin() as conn:
+        rows = conn.execute(text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'pagerduty_incidents'
+        """)).fetchall()
+        existing = {r[0] for r in rows}
+
+        for col_name, col_type in expected_columns_sql.items():
+            if col_name not in existing:
+                sql = f'ALTER TABLE pagerduty_incidents ADD COLUMN IF NOT EXISTS "{col_name}" {col_type}'
+                print(f"Applying schema change: {sql}")
+                conn.execute(text(sql))
 
 
 # ==============================================================================
@@ -442,7 +473,8 @@ def lambda_handler(event, context):
 
         engine = get_engine(db_secret)
         Base.metadata.create_all(engine)
-
+        ensure_expected_columns(engine)
+        
         # Choose incidents to enrich
         with Session(engine) as session:
             if not force_refresh:
